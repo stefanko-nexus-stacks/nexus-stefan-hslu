@@ -62,7 +62,7 @@ USER_EMAIL=$(grep -E '^user_email\s*=' "$TOFU_DIR/config.tfvars" 2>/dev/null | s
 USER_EMAIL=${USER_EMAIL:-$ADMIN_EMAIL}
 # Gitea user username derived from user_email (part before @)
 GITEA_USER_USERNAME="${USER_EMAIL%%@*}"
-SSH_HOST="ssh.${DOMAIN}"
+SSH_HOST="ssh-stefan-hslu.nona.company"
 
 if [ -z "$DOMAIN" ]; then
     echo -e "${RED}Error: Could not read domain from config.tfvars${NC}"
@@ -505,7 +505,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "kestra"; then
 KESTRA_ADMIN_USER=$ADMIN_EMAIL
 KESTRA_ADMIN_PASSWORD=$KESTRA_PASS
 KESTRA_DB_PASSWORD=$KESTRA_DB_PASS
-KESTRA_URL=https://kestra.${DOMAIN}
+KESTRA_URL=https://kestra-stefan-hslu.nona.company
 EOF
     echo -e "${GREEN}  ✓ Kestra .env generated${NC}"
 fi
@@ -516,7 +516,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "cloudbeaver"; then
     cat > "$STACKS_DIR/cloudbeaver/.env" << EOF
 # Auto-generated from OpenTofu secrets - DO NOT COMMIT
 CB_SERVER_NAME=Nexus CloudBeaver
-CB_SERVER_URL=https://cloudbeaver.${DOMAIN}
+CB_SERVER_URL=https://cloudbeaver-stefan-hslu.nona.company
 CB_ADMIN_NAME=$ADMIN_USERNAME
 CB_ADMIN_PASSWORD=$CLOUDBEAVER_PASS
 EOF
@@ -564,14 +564,14 @@ POSTGRES_PASSWORD=${HOPPSCOTCH_DB_PASS}
 JWT_SECRET=${HOPPSCOTCH_JWT}
 SESSION_SECRET=${HOPPSCOTCH_SESSION}
 DATA_ENCRYPTION_KEY=${HOPPSCOTCH_ENCRYPTION}
-REDIRECT_URL=https://hoppscotch.${DOMAIN}
-WHITELISTED_ORIGINS=https://hoppscotch.${DOMAIN}
-VITE_BASE_URL=https://hoppscotch.${DOMAIN}
-VITE_SHORTCODE_BASE_URL=https://hoppscotch.${DOMAIN}
-VITE_ADMIN_URL=https://hoppscotch.${DOMAIN}/admin
-VITE_BACKEND_GQL_URL=https://hoppscotch.${DOMAIN}/backend/graphql
-VITE_BACKEND_WS_URL=wss://hoppscotch.${DOMAIN}/backend/graphql
-VITE_BACKEND_API_URL=https://hoppscotch.${DOMAIN}/backend/v1
+REDIRECT_URL=https://hoppscotch-stefan-hslu.nona.company
+WHITELISTED_ORIGINS=https://hoppscotch-stefan-hslu.nona.company
+VITE_BASE_URL=https://hoppscotch-stefan-hslu.nona.company
+VITE_SHORTCODE_BASE_URL=https://hoppscotch-stefan-hslu.nona.company
+VITE_ADMIN_URL=https://hoppscotch-stefan-hslu.nona.company/admin
+VITE_BACKEND_GQL_URL=https://hoppscotch-stefan-hslu.nona.company/backend/graphql
+VITE_BACKEND_WS_URL=wss://hoppscotch-stefan-hslu.nona.company/backend/graphql
+VITE_BACKEND_API_URL=https://hoppscotch-stefan-hslu.nona.company/backend/v1
 VITE_ALLOWED_AUTH_PROVIDERS=EMAIL
 MAILER_USE_CUSTOM_CONFIGS=true
 MAILER_SMTP_ENABLE=false
@@ -631,7 +631,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "prefect"; then
     cat > "$STACKS_DIR/prefect/.env" << EOF
 # Auto-generated from OpenTofu secrets - DO NOT COMMIT
 PREFECT_DB_PASSWORD=${PREFECT_DB_PASS}
-PREFECT_UI_API_URL=https://prefect.${DOMAIN}/api
+PREFECT_UI_API_URL=https://prefect-stefan-hslu.nona.company/api
 EOF
     echo -e "${GREEN}  ✓ Prefect .env generated${NC}"
 fi
@@ -785,7 +785,7 @@ LAKEFS_BLOCKSTORE_S3_DISCOVER_BUCKET_REGION=false
 LAKEFS_BLOCKSTORE_S3_REGION=${HETZNER_S3_REGION}
 LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID=${HETZNER_S3_ACCESS_KEY}
 LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY=${HETZNER_S3_SECRET_KEY}
-LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs.${DOMAIN}
+LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs-stefan-hslu.nona.company
 # Note: LAKEFS_INSTALLATION_* vars only work with database.type=local
 # Admin user is created via API in Step 7/7
 POSTGRES_PASSWORD=${LAKEFS_DB_PASS}
@@ -800,7 +800,7 @@ LAKEFS_DATABASE_POSTGRES_CONNECTION_STRING=postgres://nexus-lakefs:${LAKEFS_DB_P
 LAKEFS_AUTH_ENCRYPT_SECRET_KEY=${LAKEFS_ENCRYPT_SECRET}
 LAKEFS_BLOCKSTORE_TYPE=local
 LAKEFS_BLOCKSTORE_LOCAL_PATH=/data
-LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs.${DOMAIN}
+LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs-stefan-hslu.nona.company
 # Note: LAKEFS_INSTALLATION_* vars only work with database.type=local
 # Admin user is created via API in Step 7/7
 POSTGRES_PASSWORD=${LAKEFS_DB_PASS}
@@ -957,7 +957,7 @@ NC_DB=pg://nocodb-db:5432?u=nexus-nocodb&p=${NOCODB_DB_PASS}&d=nocodb
 NC_AUTH_JWT_SECRET=${NOCODB_JWT_SECRET}
 NC_ADMIN_EMAIL=${ADMIN_EMAIL}
 NC_ADMIN_PASSWORD=${NOCODB_ADMIN_PASS}
-NC_PUBLIC_URL=https://nocodb.${DOMAIN}
+NC_PUBLIC_URL=https://nocodb-stefan-hslu.nona.company
 NOCODB_DB_PASSWORD=${NOCODB_DB_PASS}
 EOF
     echo -e "${GREEN}  ✓ NocoDB .env generated${NC}"
@@ -1751,7 +1751,7 @@ EOF
     {"secretKey": "GITEA_ADMIN_PASSWORD", "secretValue": "$GITEA_ADMIN_PASS", "tagIds": ["$GITEA_TAG"]},
     {"secretKey": "GITEA_USER_USERNAME", "secretValue": "$GITEA_USER_USERNAME", "tagIds": ["$GITEA_TAG"]},
     {"secretKey": "GITEA_USER_PASSWORD", "secretValue": "$GITEA_USER_PASS", "tagIds": ["$GITEA_TAG"]},
-    {"secretKey": "GITEA_REPO_URL", "secretValue": "https://git.${DOMAIN}/${ADMIN_USERNAME}/nexus-${DOMAIN//./-}-gitea.git", "tagIds": ["$GITEA_TAG"]},
+    {"secretKey": "GITEA_REPO_URL", "secretValue": "https://git-stefan-hslu.nona.company/${ADMIN_USERNAME}/nexus-${DOMAIN//./-}-gitea.git", "tagIds": ["$GITEA_TAG"]},
     {"secretKey": "GITEA_DB_PASSWORD", "secretValue": "$GITEA_DB_PASS", "tagIds": ["$GITEA_TAG"]},
     {"secretKey": "CLICKHOUSE_USERNAME", "secretValue": "nexus-clickhouse", "tagIds": ["$CLICKHOUSE_TAG"]},
     {"secretKey": "CLICKHOUSE_PASSWORD", "secretValue": "$CLICKHOUSE_ADMIN_PASS", "tagIds": ["$CLICKHOUSE_TAG"]},
@@ -2651,7 +2651,7 @@ triggers:
                     -H 'Content-Type: application/json' \
                     -d '{
                         \"name\": \"Woodpecker CI\",
-                        \"redirect_uris\": [\"https://woodpecker.${DOMAIN}/authorize\"],
+                        \"redirect_uris\": [\"https://woodpecker-stefan-hslu.nona.company/authorize\"],
                         \"confidential_client\": true
                     }'" 2>/dev/null || echo "")
 
@@ -2796,7 +2796,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "wikijs" && [ -n "$WIKIJS_ADMIN_PASS" ]; 
         SETUP_PAYLOAD=$(jq -n \
             --arg email "$WIKIJS_EMAIL" \
             --arg pass "$WIKIJS_ADMIN_PASS" \
-            --arg url "https://wiki.${DOMAIN}" \
+            --arg url "https://wiki-stefan-hslu.nona.company" \
             '{query: "mutation ($input: SetupInput!) { setup(input: $input) { responseResult { succeeded message } } }", variables: {input: {adminEmail: $email, adminPassword: $pass, adminPasswordConfirm: $pass, siteUrl: $url, telemetry: false}}}')
 
         RESULT=$(printf '%s' "$SETUP_PAYLOAD" | ssh nexus "curl -s -X POST 'http://localhost:3005/graphql' \
