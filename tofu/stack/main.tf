@@ -21,7 +21,7 @@ locals {
 
 resource "hcloud_ssh_key" "main" {
   name       = "${local.resource_prefix}-key"
-  public_key = file(var.ssh_public_key_path)
+  public_key = trimspace(file(var.ssh_public_key_path))
 }
 
 # =============================================================================
@@ -73,10 +73,26 @@ resource "random_password" "dagster_db" {
   special = false
 }
 
-# Kestra admin password
+# Kestra admin password.
+#
+# Kestra v1.0 OSS basic-auth has a hard validator: the password MUST
+# contain at least one uppercase, one lowercase, AND one digit. If any
+# of the three is missing, Kestra silently *disables* basic-auth — all
+# /api/v1/* calls return 401, /api/v1/configs shows
+# `basicAuthEnabled: null`, and `/api/v1/basicAuthValidationErrors`
+# spits out the exact rule. With `special = false` and no character-
+# class minima, `random_password` produced an alphabetic-only string
+# (no digit) and broke every Kestra sync-flow registration in
+# deploy.sh on that spin-up.
+#
+# `min_numeric/upper/lower = 1` enforces Kestra's rule on every
+# regenerated password.
 resource "random_password" "kestra_admin" {
-  length  = 24
-  special = false
+  length      = 24
+  special     = false
+  min_numeric = 1
+  min_upper   = 1
+  min_lower   = 1
 }
 
 # Kestra database password
@@ -129,6 +145,17 @@ resource "random_password" "mage_admin" {
 
 # MinIO root password
 resource "random_password" "minio_root" {
+  length  = 24
+  special = false
+}
+
+# SFTPGo admin (web UI / REST API) and default user (SFTP login)
+resource "random_password" "sftpgo_admin" {
+  length  = 24
+  special = false
+}
+
+resource "random_password" "sftpgo_user" {
   length  = 24
   special = false
 }
@@ -494,7 +521,7 @@ resource "hcloud_server" "main" {
     command -v docker >/dev/null 2>&1 || { echo "FATAL: Docker installation failed" >&2; exit 1; }
 
     # Install security tools
-    apt-get install -y fail2ban unattended-upgrades
+    apt-get install -y fail2ban unattended-upgrades jq
     
     # Configure automatic security updates
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
@@ -586,7 +613,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
   config {
     # SSH access
     ingress_rule {
-      hostname = "ssh-stefan-hslu.nona.company"
+      hostname = "ssh.${var.domain}"
       service  = "ssh://localhost:22"
     }
 
@@ -594,7 +621,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
     dynamic "ingress_rule" {
       for_each = local.enabled_services_with_subdomain
       content {
-        hostname = "${ingress_rule.value.subdomain}-stefan-hslu.nona.company"
+        hostname = "${ingress_rule.value.subdomain}.${var.domain}"
         service  = "http://localhost:${ingress_rule.value.port}"
       }
     }
@@ -612,7 +639,7 @@ resource "cloudflare_zero_trust_tunnel_cloudflared_config" "main" {
 
 resource "cloudflare_record" "ssh" {
   zone_id = var.cloudflare_zone_id
-  name    = "ssh-stefan-hslu"
+  name    = "ssh"
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -626,7 +653,7 @@ resource "cloudflare_record" "services" {
   depends_on = [cloudflare_zero_trust_tunnel_cloudflared_config.main]
 
   zone_id = var.cloudflare_zone_id
-  name    = "${each.value.subdomain}-stefan-hslu"
+  name    = each.value.subdomain
   content = "${cloudflare_zero_trust_tunnel_cloudflared.main.id}.cfargotunnel.com"
   type    = "CNAME"
   proxied = true
@@ -650,7 +677,7 @@ resource "cloudflare_record" "firewall_tcp" {
   for_each = var.ipv6_only ? {} : local.firewall_dns_records
 
   zone_id = var.cloudflare_zone_id
-  name    = "${each.value.dns_record}-stefan-hslu"
+  name    = each.value.dns_record
   content = hcloud_server.main.ipv4_address
   type    = "A"
   proxied = false
@@ -665,7 +692,7 @@ resource "cloudflare_record" "firewall_tcp" {
 resource "cloudflare_zero_trust_access_application" "ssh" {
   zone_id          = var.cloudflare_zone_id
   name             = "${local.resource_prefix} SSH"
-  domain           = "ssh-stefan-hslu.nona.company"
+  domain           = "ssh.${var.domain}"
   type             = "ssh"
   session_duration = "1h"
 }
@@ -738,7 +765,7 @@ resource "cloudflare_zero_trust_access_application" "services" {
 
   zone_id           = var.cloudflare_zone_id
   name              = "${local.resource_prefix} ${title(each.key)}"
-  domain            = "${each.value.subdomain}-stefan-hslu.nona.company"
+  domain            = "${each.value.subdomain}.${var.domain}"
   type              = "self_hosted"
   # Wetty uses shorter session duration (1h) for enhanced security
   # Other services use 24h for better user experience

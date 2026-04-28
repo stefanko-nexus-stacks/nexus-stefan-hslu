@@ -61,14 +61,35 @@ DOMAIN=$(grep -E '^domain\s*=' "$TOFU_DIR/config.tfvars" 2>/dev/null | sed 's/.*
 ADMIN_EMAIL=$(grep -E '^admin_email\s*=' "$TOFU_DIR/config.tfvars" 2>/dev/null | sed 's/.*"\(.*\)"/\1/' || echo "")
 USER_EMAIL=$(grep -E '^user_email\s*=' "$TOFU_DIR/config.tfvars" 2>/dev/null | sed 's/.*"\(.*\)"/\1/' || echo "")
 
-# ADMIN_EMAIL must be distinct from USER_EMAIL: Gitea enforces uniqueness on
-# user.email, so if both rows are created with the same address the second
+# Gitea needs a single address for the user.email column; USER_EMAIL may
+# be a comma-separated list (student + teacher admins, so tofu/stack can
+# build the Cloudflare Access allow-list from every entry). Strip to the
+# first entry here — Gitea's validator rejects commas with "e-mail address
+# contains unsupported character" and the raw list would otherwise reach
+# `gitea admin user create --email`. Downstream derivations in this script
+# (workspace-config block ~line 1193, user-create block ~line 3000,
+# workspace-repo block ~line 3071) all reuse GITEA_USER_EMAIL for the same
+# single-value semantics. Derived BEFORE the ADMIN_EMAIL collision check
+# below so that check compares single-vs-single (not admin-single-vs-
+# user-list, which would never match and silently skip the remap).
+# Trim whitespace: upstream joins commonly emit ", " between entries
+# (`a@b.com, c@d.com`), and self-provisioned tfvars can have leading
+# spaces inside the quoted value. Gitea/Windmill/Wiki.js validators all
+# reject space-prefixed emails. ADMIN_EMAIL gets the same treatment so
+# the equality check below compares normalized single addresses.
+ADMIN_EMAIL=$(printf '%s' "$ADMIN_EMAIL" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+GITEA_USER_EMAIL=$(printf '%s' "${USER_EMAIL%%,*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+GITEA_USER_USERNAME="${GITEA_USER_EMAIL%%@*}"
+
+# ADMIN_EMAIL must be distinct from GITEA_USER_EMAIL: Gitea enforces uniqueness
+# on user.email, so if both rows are created with the same address the second
 # create fails with "e-mail already in use". The admin-panel caller
-# (Nexus-Stack-for-Education) passes both values from the same field today,
-# and self-provisioned tfvars can omit admin_email entirely. In either case
-# fall back to a synthetic gitea-admin@${DOMAIN} that's guaranteed distinct
-# from any normal human USER_EMAIL.
-if [ -z "$ADMIN_EMAIL" ] || [ "$ADMIN_EMAIL" = "$USER_EMAIL" ]; then
+# (Nexus-Stack-for-Education) passes both values from the same source field
+# today (admin_email = first entry of user_email list), and self-provisioned
+# tfvars can omit admin_email entirely. In either case fall back to a
+# synthetic gitea-admin@${DOMAIN} that's guaranteed distinct from any real
+# human email.
+if [ -z "$ADMIN_EMAIL" ] || [ "$ADMIN_EMAIL" = "$GITEA_USER_EMAIL" ]; then
     # Use a local-part that no human-email scheme would produce. `admin@${DOMAIN}`
     # is also safe for the stack-scoped student domains (e.g. <user>.nona.company),
     # but `gitea-admin` narrows the probability of collision with a real USER_EMAIL
@@ -78,12 +99,11 @@ fi
 OM_PRINCIPAL_DOMAIN=$(echo "$ADMIN_EMAIL" | cut -d'@' -f2)
 
 # No USER_EMAIL fallback to ADMIN_EMAIL — that was the root of the Gitea
-# uniqueness collision. The Gitea user-create block below is already gated
-# by `[ -n "$USER_EMAIL" ]`, so an unset USER_EMAIL skips user creation
-# cleanly instead of colliding with the admin row.
-# Gitea user username derived from user_email (part before @)
-GITEA_USER_USERNAME="${USER_EMAIL%%@*}"
-SSH_HOST="ssh-stefan-hslu.nona.company"
+# uniqueness collision. The Gitea user-create block below is gated on
+# `[ -n "$GITEA_USER_EMAIL" ]`, so an empty-after-trim GITEA_USER_EMAIL
+# (no USER_EMAIL set, or its first entry was whitespace-only) skips user
+# creation cleanly instead of colliding with the admin row.
+SSH_HOST="ssh.${DOMAIN}"
 
 if [ -z "$DOMAIN" ]; then
     echo -e "${RED}Error: Could not read domain from config.tfvars${NC}"
@@ -119,6 +139,8 @@ SUPERSET_SECRET=$(echo "$SECRETS_JSON" | jq -r '.superset_secret_key // empty')
 CLOUDBEAVER_PASS=$(echo "$SECRETS_JSON" | jq -r '.cloudbeaver_admin_password // empty')
 MAGE_PASS=$(echo "$SECRETS_JSON" | jq -r '.mage_admin_password // empty')
 MINIO_ROOT_PASS=$(echo "$SECRETS_JSON" | jq -r '.minio_root_password // empty')
+SFTPGO_ADMIN_PASS=$(echo "$SECRETS_JSON" | jq -r '.sftpgo_admin_password // empty')
+SFTPGO_USER_PASS=$(echo "$SECRETS_JSON" | jq -r '.sftpgo_user_password // empty')
 HOPPSCOTCH_DB_PASS=$(echo "$SECRETS_JSON" | jq -r '.hoppscotch_db_password // empty')
 HOPPSCOTCH_JWT=$(echo "$SECRETS_JSON" | jq -r '.hoppscotch_jwt_secret // empty')
 HOPPSCOTCH_SESSION=$(echo "$SECRETS_JSON" | jq -r '.hoppscotch_session_secret // empty')
@@ -357,12 +379,31 @@ MAX_RETRIES=15
 RETRY=0
 TIMEOUT=5
 SSH_ERR=$(mktemp)
-trap 'rm -f "$SSH_ERR"' EXIT
+# Holds remote tmp paths (one per line) that must be removed on the
+# server when the runner exits — including mid-loop interrupts or
+# workflow timeouts. The EXIT trap walks this list and ssh-rm's each.
+# Any later block that mktemp's a file on `nexus` should append the
+# resulting path here, so cleanup is centralised in one trap.
+REMOTE_CLEANUP_PATHS=$(mktemp)
+# RUNNER_CLEANUP_PATHS — same idea as REMOTE_CLEANUP_PATHS but for
+# secret-bearing temp files on the *runner* itself. Any block that
+# mktemp's a runner-local file containing plaintext secrets (Infisical
+# raw responses, base64-decoded credentials, etc.) should append its
+# path here so the EXIT trap reliably wipes them even when the deploy
+# is interrupted, set -e exits early, or a CI runner gets cancelled.
+RUNNER_CLEANUP_PATHS=$(mktemp)
+trap 'rm -f "$SSH_ERR"; if [ -s "$REMOTE_CLEANUP_PATHS" ]; then while IFS= read -r p; do [ -n "$p" ] && ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=3 -o ServerAliveCountMax=2 nexus "rm -f \"$p\"" 2>/dev/null || true; done < "$REMOTE_CLEANUP_PATHS"; fi; rm -f "$REMOTE_CLEANUP_PATHS"; if [ -s "$RUNNER_CLEANUP_PATHS" ]; then while IFS= read -r p; do [ -n "$p" ] && rm -f "$p"; done < "$RUNNER_CLEANUP_PATHS"; fi; rm -f "$RUNNER_CLEANUP_PATHS"' EXIT
 while [ $RETRY -lt $MAX_RETRIES ]; do
     if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=$TIMEOUT -o BatchMode=yes nexus 'echo ok' 2>"$SSH_ERR"; then
         echo -e "${GREEN}  ✓ SSH connection established${NC}"
         rm -f "$SSH_ERR"
-        trap - EXIT
+        # NOTE: do NOT `trap - EXIT` here. The EXIT trap installed at
+        # the top of this section also walks $REMOTE_CLEANUP_PATHS and
+        # ssh-rm's any remote tmp files that downstream blocks (seed
+        # loop, secret-sync, …) registered. Removing the trap on first
+        # SSH success would leave token-bearing curl --config files
+        # behind on the server if the deploy aborts later. The trap'\''s
+        # `rm -f $SSH_ERR` is no-op-safe when the file is already gone.
         break
     fi
     RETRY=$((RETRY + 1))
@@ -389,8 +430,35 @@ if [ $RETRY -eq $MAX_RETRIES ]; then
     echo -e "${YELLOW}  Last SSH error:${NC}"
     cat "$SSH_ERR" 2>/dev/null || echo "    (no error output captured)"
     rm -f "$SSH_ERR"
-    trap - EXIT
+    # Don't `trap - EXIT` here. The global EXIT trap handles cleanup
+    # of both $REMOTE_CLEANUP_PATHS and $RUNNER_CLEANUP_PATHS list
+    # files (the latter holds runner-side mktemp paths to plaintext
+    # secrets — registered by later blocks). Disabling the trap on
+    # this early exit would skip those rm-f's. The trap is no-op-safe
+    # for files already removed (`rm -f`) and for empty list files
+    # (the `while read` loop simply matches no lines).
     exit 1
+fi
+
+# -----------------------------------------------------------------------------
+# Ensure jq is installed on the server.
+# -----------------------------------------------------------------------------
+# `jq` is now bundled into the cloud-init `apt-get install -y …` step
+# in `tofu/stack/main.tf`, so freshly provisioned VMs (after destroy-all)
+# already have it. This block is for already-running VMs that were
+# created BEFORE that change — without jq, the SFTPGo user-creation
+# heredoc and the Kestra register-flow verification block silently
+# break (jq writes "command not found" to stderr that gets swallowed,
+# the consuming `curl` ends up with empty stdin, and the operator
+# sees mysterious 400/empty responses). Idempotent: `apt-get install`
+# is a near-instant no-op when the package is already present.
+if ! ssh nexus "command -v jq" >/dev/null 2>&1; then
+    echo "  Installing jq on the server (one-time bootstrap for VMs created before jq was added to cloud-init)..."
+    if ! ssh nexus "sudo apt-get update -qq >/dev/null && sudo apt-get install -y -qq jq >/dev/null"; then
+        echo -e "${RED}Error: failed to install jq on the server. SFTPGo / Kestra register-verify blocks rely on jq.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}  ✓ jq installed${NC}"
 fi
 
 # -----------------------------------------------------------------------------
@@ -552,7 +620,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "kestra"; then
 KESTRA_ADMIN_USER=$ADMIN_EMAIL
 KESTRA_ADMIN_PASSWORD=$KESTRA_PASS
 KESTRA_DB_PASSWORD=$KESTRA_DB_PASS
-KESTRA_URL=https://kestra-stefan-hslu.nona.company
+KESTRA_URL=https://kestra.${DOMAIN}
 EOF
     echo -e "${GREEN}  ✓ Kestra .env generated${NC}"
 fi
@@ -563,7 +631,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "cloudbeaver"; then
     cat > "$STACKS_DIR/cloudbeaver/.env" << EOF
 # Auto-generated from OpenTofu secrets - DO NOT COMMIT
 CB_SERVER_NAME=Nexus CloudBeaver
-CB_SERVER_URL=https://cloudbeaver-stefan-hslu.nona.company
+CB_SERVER_URL=https://cloudbeaver.${DOMAIN}
 CB_ADMIN_NAME=nexus-cloudbeaver
 CB_ADMIN_PASSWORD=$CLOUDBEAVER_PASS
 EOF
@@ -591,6 +659,52 @@ EOF
     echo -e "${GREEN}  ✓ MinIO .env generated${NC}"
 fi
 
+# Generate SFTPGo .env from OpenTofu secrets.
+# Only the admin password is consumed by docker-compose env-substitution
+# (SFTPGo bootstraps the admin from SFTPGO_DEFAULT_ADMIN_*). The default
+# user `nexus-default` is created later via the SFTPGo REST API once the
+# container is up.
+#
+# Empty-password guard: if either `SFTPGO_ADMIN_PASS` or `SFTPGO_USER_PASS`
+# arrives empty (typical cause: SFTPGo got enabled without running
+# OpenTofu first, so the `random_password.sftpgo_admin` /
+# `random_password.sftpgo_user` resources aren't in state yet and
+# `jq -r '... // empty'` returned ""), abort the deploy. Writing the
+# .env anyway would let docker-compose start SFTPGo with a blank-
+# password admin (= a public Cloudflare-Access-protected service with
+# no second auth factor) — that's a security regression worth failing
+# fast on, not just warning. Recovery is one step: run `tofu apply`,
+# then re-run spin-up. Fail-fast here is consistent with other tofu-
+# state-required errors in deploy.sh (e.g., empty $DOMAIN at line 108).
+if echo "$ENABLED_SERVICES" | grep -qw "sftpgo"; then
+    if [ -z "$SFTPGO_ADMIN_PASS" ] || [ -z "$SFTPGO_USER_PASS" ]; then
+        echo -e "${RED}Error: SFTPGo is enabled but admin/user password is empty in OpenTofu state.${NC}"
+        echo -e "${RED}       Cause: random_password.sftpgo_admin and/or random_password.sftpgo_user${NC}"
+        echo -e "${RED}       are not in state yet. Run \`tofu apply\` (which is what the spin-up${NC}"
+        echo -e "${RED}       workflow does before deploy.sh) and re-run, then SECRETS_JSON will${NC}"
+        echo -e "${RED}       carry .sftpgo_admin_password / .sftpgo_user_password.${NC}"
+        exit 1
+    fi
+    echo "  Generating SFTPGo config from OpenTofu secrets..."
+    mkdir -p "$STACKS_DIR/sftpgo"
+    # umask 077 inside a subshell forces the .env to be created at
+    # mode 0600 from byte 0, so the admin password is never visible
+    # to other local users on the runner (or on the VM after rsync,
+    # which preserves modes). chmod 600 after-the-fact is also
+    # applied as belt-and-braces in case the file already existed
+    # at a wider permission and `cat >` only truncates content,
+    # not mode.
+    (
+        umask 077
+        cat > "$STACKS_DIR/sftpgo/.env" << EOF
+# Auto-generated from OpenTofu secrets - DO NOT COMMIT
+SFTPGO_ADMIN_PASSWORD=$SFTPGO_ADMIN_PASS
+EOF
+    )
+    chmod 600 "$STACKS_DIR/sftpgo/.env"
+    echo -e "${GREEN}  ✓ SFTPGo .env generated (mode 0600)${NC}"
+fi
+
 # Generate RedPanda Console .env from OpenTofu secrets
 if echo "$ENABLED_SERVICES" | grep -qw "redpanda-console"; then
     echo "  Generating RedPanda Console config from OpenTofu secrets..."
@@ -611,14 +725,14 @@ POSTGRES_PASSWORD=${HOPPSCOTCH_DB_PASS}
 JWT_SECRET=${HOPPSCOTCH_JWT}
 SESSION_SECRET=${HOPPSCOTCH_SESSION}
 DATA_ENCRYPTION_KEY=${HOPPSCOTCH_ENCRYPTION}
-REDIRECT_URL=https://hoppscotch-stefan-hslu.nona.company
-WHITELISTED_ORIGINS=https://hoppscotch-stefan-hslu.nona.company
-VITE_BASE_URL=https://hoppscotch-stefan-hslu.nona.company
-VITE_SHORTCODE_BASE_URL=https://hoppscotch-stefan-hslu.nona.company
-VITE_ADMIN_URL=https://hoppscotch-stefan-hslu.nona.company/admin
-VITE_BACKEND_GQL_URL=https://hoppscotch-stefan-hslu.nona.company/backend/graphql
-VITE_BACKEND_WS_URL=wss://hoppscotch-stefan-hslu.nona.company/backend/graphql
-VITE_BACKEND_API_URL=https://hoppscotch-stefan-hslu.nona.company/backend/v1
+REDIRECT_URL=https://hoppscotch.${DOMAIN}
+WHITELISTED_ORIGINS=https://hoppscotch.${DOMAIN}
+VITE_BASE_URL=https://hoppscotch.${DOMAIN}
+VITE_SHORTCODE_BASE_URL=https://hoppscotch.${DOMAIN}
+VITE_ADMIN_URL=https://hoppscotch.${DOMAIN}/admin
+VITE_BACKEND_GQL_URL=https://hoppscotch.${DOMAIN}/backend/graphql
+VITE_BACKEND_WS_URL=wss://hoppscotch.${DOMAIN}/backend/graphql
+VITE_BACKEND_API_URL=https://hoppscotch.${DOMAIN}/backend/v1
 VITE_ALLOWED_AUTH_PROVIDERS=EMAIL
 MAILER_USE_CUSTOM_CONFIGS=true
 MAILER_SMTP_ENABLE=false
@@ -737,7 +851,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "prefect"; then
     cat > "$STACKS_DIR/prefect/.env" << EOF
 # Auto-generated from OpenTofu secrets - DO NOT COMMIT
 PREFECT_DB_PASSWORD=${PREFECT_DB_PASS}
-PREFECT_UI_API_URL=https://prefect-stefan-hslu.nona.company/api
+PREFECT_UI_API_URL=https://prefect.${DOMAIN}/api
 EOF
     echo -e "${GREEN}  ✓ Prefect .env generated${NC}"
 fi
@@ -905,7 +1019,7 @@ LAKEFS_BLOCKSTORE_S3_DISCOVER_BUCKET_REGION=false
 LAKEFS_BLOCKSTORE_S3_REGION=${HETZNER_S3_REGION}
 LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID=${HETZNER_S3_ACCESS_KEY}
 LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY=${HETZNER_S3_SECRET_KEY}
-LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs-stefan-hslu.nona.company
+LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs.${DOMAIN}
 # Note: LAKEFS_INSTALLATION_* vars only work with database.type=local
 # Admin user is created via API in Step 7/7
 POSTGRES_PASSWORD=${LAKEFS_DB_PASS}
@@ -920,7 +1034,7 @@ LAKEFS_DATABASE_POSTGRES_CONNECTION_STRING=postgres://nexus-lakefs:${LAKEFS_DB_P
 LAKEFS_AUTH_ENCRYPT_SECRET_KEY=${LAKEFS_ENCRYPT_SECRET}
 LAKEFS_BLOCKSTORE_TYPE=local
 LAKEFS_BLOCKSTORE_LOCAL_PATH=/data
-LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs-stefan-hslu.nona.company
+LAKEFS_GATEWAYS_S3_DOMAIN_NAME=s3.lakefs.${DOMAIN}
 # Note: LAKEFS_INSTALLATION_* vars only work with database.type=local
 # Admin user is created via API in Step 7/7
 POSTGRES_PASSWORD=${LAKEFS_DB_PASS}
@@ -1137,7 +1251,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "appsmith" && [ -n "$APPSMITH_ENCRYPTION_
 APPSMITH_ENCRYPTION_PASSWORD=${APPSMITH_ENCRYPTION_PASSWORD}
 APPSMITH_ENCRYPTION_SALT=${APPSMITH_ENCRYPTION_SALT}
 APPSMITH_DISABLE_TELEMETRY=true
-APPSMITH_CUSTOM_DOMAIN=https://appsmith-stefan-hslu.nona.company
+APPSMITH_CUSTOM_DOMAIN=https://appsmith.${DOMAIN}
 EOF
     echo -e "${GREEN}  ✓ Appsmith .env generated${NC}"
 fi
@@ -1151,7 +1265,7 @@ NC_DB=pg://nocodb-db:5432?u=nexus-nocodb&p=${NOCODB_DB_PASS}&d=nocodb
 NC_AUTH_JWT_SECRET=${NOCODB_JWT_SECRET}
 NC_ADMIN_EMAIL=${ADMIN_EMAIL}
 NC_ADMIN_PASSWORD=${NOCODB_ADMIN_PASS}
-NC_PUBLIC_URL=https://nocodb-stefan-hslu.nona.company
+NC_PUBLIC_URL=https://nocodb.${DOMAIN}
 NOCODB_DB_PASSWORD=${NOCODB_DB_PASS}
 EOF
     echo -e "${GREEN}  ✓ NocoDB .env generated${NC}"
@@ -1181,16 +1295,22 @@ fi
 # Security: Credentials are passed via GITEA_USERNAME/GITEA_PASSWORD env vars and
 # injected into containers via .netrc at startup (not embedded in the repo URL).
 if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; then
-    # Workspace-config identity: when no separate USER_EMAIL is configured,
-    # fall back to the admin identity for repo URLs and service .env values.
+    # Workspace-config identity: when no separate single-address user is
+    # configured (GITEA_USER_EMAIL empty after trim+comma-split), fall back
+    # to the admin identity for repo URLs and service .env values.
     # Downstream service containers need a non-empty username + email for
     # git operations (empty values would produce invalid URLs like
     # http://gitea:3000//repo.git). This fallback is config-only and does
     # NOT reintroduce the email-uniqueness collision the parent PR fixed:
-    # the Gitea user-create block below stays gated on `[ -n "$USER_EMAIL" ]`
-    # and skips cleanly when USER_EMAIL is unset.
-    if [ -n "$USER_EMAIL" ]; then
-        GITEA_USER_USERNAME="${USER_EMAIL%%@*}"
+    # the Gitea user-create block below also gates on
+    # `[ -n "$GITEA_USER_EMAIL" ]` and skips cleanly when empty.
+    #
+    # Gate uses GITEA_USER_EMAIL (not raw USER_EMAIL) so a USER_EMAIL whose
+    # first entry is empty/whitespace (e.g. a leading `,` in the joined
+    # list) correctly routes to the admin fallback.
+    if [ -n "$GITEA_USER_EMAIL" ]; then
+        # See top-of-script comment (~line 85) on GITEA_USER_EMAIL vs USER_EMAIL.
+        GITEA_USER_USERNAME="${GITEA_USER_EMAIL%%@*}"
     else
         GITEA_USER_USERNAME="$ADMIN_USERNAME"
     fi
@@ -1200,7 +1320,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
     #   later in the mirror block regardless of USER_EMAIL)
     # - no mirror → admin's default empty repo (created further below only when
     #   GH_MIRROR_REPOS is unset)
-    if [ -n "${GH_MIRROR_REPOS:-}" ] && [ -n "$USER_EMAIL" ]; then
+    if [ -n "${GH_MIRROR_REPOS:-}" ] && [ -n "$GITEA_USER_EMAIL" ]; then
         # Derive repo name from first mirror URL (e.g. https://github.com/user/Bsc_EDS_GIS_FS2026)
         FIRST_MIRROR=$(echo "$GH_MIRROR_REPOS" | cut -d',' -f1 | tr -d ' ')
         WORKSPACE_REPO_NAME=$(basename "$FIRST_MIRROR" .git)
@@ -1226,13 +1346,88 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
         GITEA_REPO_OWNER="${ADMIN_USERNAME}"
         GITEA_REPO_URL="http://gitea:3000/${GITEA_REPO_OWNER}/${REPO_NAME}.git"
     fi
-    # Require BOTH a user email and a user password to use user credentials
-    # for service Git integration. Either one missing → fall back to admin.
-    if [ -n "$USER_EMAIL" ] && [ -n "$GITEA_USER_PASS" ]; then
+
+    # Resolve the workspace repo's default branch.
+    #
+    # Three paths converge on this variable:
+    #   1. Kestra `system.git-sync` / `system.flow-sync` flow YAML
+    #      (`branch: ${WORKSPACE_BRANCH}`)
+    #   2. The post-fork merge-upstream POST (mirror mode only)
+    #   3. Anywhere else in this script that needs a Git ref for the
+    #      workspace repo
+    #
+    # Without this, all three hardcoded `main` and broke for users
+    # mirroring a GitHub repo whose default branch is `master` (or
+    # anything else): SyncFlows clones the wrong branch and silently
+    # syncs nothing; merge-upstream returns 404 and the fork drifts.
+    #
+    # Resolution rules:
+    #   - No mirror: deploy.sh creates the repo itself with `main` →
+    #     `main` is correct, no API call needed.
+    #   - Mirror: query GitHub's REST API for the upstream repo's
+    #     `default_branch`. The fork inherits this value when Gitea
+    #     mirrors + forks the repo. Fall back to `main` on any HTTP
+    #     or parse failure (don't make this a hard dependency — a
+    #     misconfigured GH_MIRROR_TOKEN should warn, not block).
+    WORKSPACE_BRANCH="main"
+    if [ -n "${GH_MIRROR_REPOS:-}" ] && [ -n "${GH_MIRROR_TOKEN:-}" ]; then
+        FIRST_MIRROR_FOR_BRANCH=$(echo "$GH_MIRROR_REPOS" | cut -d',' -f1 | tr -d ' ')
+        # Normalize to `owner/repo`:
+        #   - strip `https://github.com/` host prefix
+        #   - strip optional `?…` / `#…` URL parts
+        #   - strip a trailing `/`
+        #   - strip a trailing `.git`
+        # Then validate the result matches `owner/repo` (no inner slashes,
+        # both halves non-empty). Anything else falls back to `main` rather
+        # than building a malformed GitHub API URL.
+        GH_OWNER_REPO=$(echo "$FIRST_MIRROR_FOR_BRANCH" \
+            | sed -E 's#^https?://github\.com/##; s#[?#].*$##; s#/$##; s#\.git$##')
+        if [ -n "$GH_OWNER_REPO" ] && [[ "$GH_OWNER_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+            # Token + URL go through a `curl --config` file (mode 0600)
+            # so $GH_MIRROR_TOKEN never appears in argv (would otherwise
+            # be visible in the runner's `ps` listing while curl runs).
+            # The mktemp + curl + cleanup are wrapped in a subshell with
+            # `trap … EXIT HUP INT TERM` so the token-bearing config file
+            # is always removed — even on Ctrl-C, runner cancellation, or
+            # an unexpected `set -e` exit between mktemp and rm. Same
+            # argv-safe pattern as the Kestra/Infisical paths elsewhere
+            # in this script.
+            DETECTED_BRANCH=$(
+                GH_API_CFG=$(mktemp)
+                trap 'rm -f "$GH_API_CFG"' EXIT HUP INT TERM
+                chmod 600 "$GH_API_CFG"
+                {
+                    printf 'header = "Authorization: Bearer %s"\n' "$GH_MIRROR_TOKEN"
+                    printf 'header = "Accept: application/vnd.github+json"\n'
+                    printf 'url = "https://api.github.com/repos/%s"\n' "$GH_OWNER_REPO"
+                    printf 'max-time = 10\nfail\nsilent\nshow-error\nlocation\n'
+                } > "$GH_API_CFG"
+                curl --config "$GH_API_CFG" 2>/dev/null \
+                    | jq -r '.default_branch // empty' 2>/dev/null || true
+            )
+            if [ -n "$DETECTED_BRANCH" ] && [ "$DETECTED_BRANCH" != "null" ]; then
+                WORKSPACE_BRANCH="$DETECTED_BRANCH"
+                if [ "$WORKSPACE_BRANCH" != "main" ]; then
+                    echo -e "${YELLOW}  ⚠ Upstream $GH_OWNER_REPO uses default branch '$WORKSPACE_BRANCH' (not 'main') — Kestra sync + fork merge-upstream will use this branch${NC}"
+                fi
+            else
+                echo -e "${YELLOW}  ⚠ Could not detect default branch for $GH_OWNER_REPO via GitHub API — defaulting to 'main' (set GH_MIRROR_TOKEN with repo:read scope if your upstream uses 'master' or another branch)${NC}"
+            fi
+        fi
+    fi
+
+    # Require BOTH a valid single user email and a user password to use user
+    # credentials for service Git integration. Either one missing → fall
+    # back to admin. Gate on GITEA_USER_EMAIL (not USER_EMAIL) so a list
+    # with empty first entry routes to the admin branch.
+    if [ -n "$GITEA_USER_EMAIL" ] && [ -n "$GITEA_USER_PASS" ]; then
         GITEA_GIT_USER="${GITEA_USER_USERNAME}"
         GITEA_GIT_PASS="${GITEA_USER_PASS}"
         GIT_AUTHOR="${GITEA_USER_USERNAME}"
-        GIT_EMAIL="${USER_EMAIL}"
+        # Single-address: GIT_EMAIL is written to service .env files and used
+        # as git author/committer email. USER_EMAIL may be a comma-list;
+        # use GITEA_USER_EMAIL so commit metadata is well-formed.
+        GIT_EMAIL="${GITEA_USER_EMAIL}"
     else
         # Fallback to admin if no user identity/password available
         GITEA_GIT_USER="${ADMIN_USERNAME}"
@@ -1968,12 +2163,21 @@ EOF
             "CLOUDBEAVER_PASSWORD" "$CLOUDBEAVER_PASS"
 
         build_folder "mage" \
-            "MAGE_USERNAME" "${USER_EMAIL:-$ADMIN_EMAIL}" \
+            "MAGE_USERNAME" "${GITEA_USER_EMAIL:-$ADMIN_EMAIL}" \
             "MAGE_PASSWORD" "$MAGE_PASS"
 
         build_folder "minio" \
             "MINIO_ROOT_USER" "nexus-minio" \
             "MINIO_ROOT_PASSWORD" "$MINIO_ROOT_PASS"
+
+        # SFTPGo: admin (web UI / REST API) + nexus-default (SFTP login).
+        # SFTPGO_USER_PASSWORD is also synced to Kestra's secret store
+        # so flows can reference it via {{ secret('SFTPGO_USER_PASSWORD') }}.
+        build_folder "sftpgo" \
+            "SFTPGO_ADMIN_USERNAME" "nexus-sftpgo" \
+            "SFTPGO_ADMIN_PASSWORD" "$SFTPGO_ADMIN_PASS" \
+            "SFTPGO_USER_USERNAME" "nexus-default" \
+            "SFTPGO_USER_PASSWORD" "$SFTPGO_USER_PASS"
 
         build_folder "nocodb" \
             "NOCODB_USERNAME" "$ADMIN_EMAIL" \
@@ -2023,10 +2227,10 @@ EOF
         build_folder "redpanda" \
             "REDPANDA_SASL_USERNAME" "nexus-redpanda" \
             "REDPANDA_SASL_PASSWORD" "$REDPANDA_ADMIN_PASS" \
-            "REDPANDA_KAFKA_PUBLIC_URL" "redpanda-kafka-stefan-hslu.nona.company:9092" \
-            "REDPANDA_SCHEMA_REGISTRY_PUBLIC_URL" "redpanda-schema-registry-stefan-hslu.nona.company:18081" \
-            "REDPANDA_ADMIN_PUBLIC_URL" "redpanda-admin-stefan-hslu.nona.company:9644" \
-            "REDPANDA_CONNECT_PUBLIC_URL" "redpanda-connect-api-stefan-hslu.nona.company:4195"
+            "REDPANDA_KAFKA_PUBLIC_URL" "redpanda-kafka.${DOMAIN}:9092" \
+            "REDPANDA_SCHEMA_REGISTRY_PUBLIC_URL" "redpanda-schema-registry.${DOMAIN}:18081" \
+            "REDPANDA_ADMIN_PUBLIC_URL" "redpanda-admin.${DOMAIN}:9644" \
+            "REDPANDA_CONNECT_PUBLIC_URL" "redpanda-connect-api.${DOMAIN}:4195"
 
         build_folder "meltano" \
             "MELTANO_DB_PASSWORD" "$MELTANO_DB_PASS"
@@ -2064,7 +2268,7 @@ EOF
             "GITEA_ADMIN_PASSWORD" "$GITEA_ADMIN_PASS" \
             "GITEA_USER_USERNAME" "$GITEA_USER_USERNAME" \
             "GITEA_USER_PASSWORD" "$GITEA_USER_PASS" \
-            "GITEA_REPO_URL" "https://git-stefan-hslu.nona.company/${GITEA_REPO_OWNER:-$ADMIN_USERNAME}/${REPO_NAME:-nexus-${DOMAIN//./-}-gitea}.git" \
+            "GITEA_REPO_URL" "https://git.${DOMAIN}/${GITEA_REPO_OWNER:-$ADMIN_USERNAME}/${REPO_NAME:-nexus-${DOMAIN//./-}-gitea}.git" \
             "GITEA_DB_PASSWORD" "$GITEA_DB_PASS"
 
         build_folder "clickhouse" \
@@ -2072,7 +2276,7 @@ EOF
             "CLICKHOUSE_PASSWORD" "$CLICKHOUSE_ADMIN_PASS"
 
         build_folder "wikijs" \
-            "WIKIJS_USERNAME" "${USER_EMAIL:-$ADMIN_EMAIL}" \
+            "WIKIJS_USERNAME" "${GITEA_USER_EMAIL:-$ADMIN_EMAIL}" \
             "WIKIJS_PASSWORD" "$WIKIJS_ADMIN_PASS" \
             "WIKIJS_DB_PASSWORD" "$WIKIJS_DB_PASS"
 
@@ -2449,6 +2653,308 @@ if echo "$ENABLED_SERVICES" | grep -qw "n8n" && [ -n "$N8N_PASS" ]; then
     fi
 fi
 
+# Configure SFTPGo: create the default user `nexus-default` with an
+# R2-backed virtual filesystem. The admin (nexus-sftpgo) is bootstrapped
+# via SFTPGO_DEFAULT_ADMIN_* env vars in docker-compose.yml; here we
+# log in with that admin to mint a JWT and POST /api/v2/users to add
+# the SFTP-facing account.
+if echo "$ENABLED_SERVICES" | grep -qw "sftpgo" && [ -n "$SFTPGO_ADMIN_PASS" ] && [ -n "$SFTPGO_USER_PASS" ]; then
+    echo "  Configuring SFTPGo..."
+
+    # Two-stage readiness: first /healthz must answer 200 (process is up,
+    # HTTP server bound), THEN the /api/v2/token basic-auth login must
+    # succeed (admin creation via SFTPGO_DEFAULT_ADMIN_* env vars has
+    # actually written to SQLite — this lags /healthz by a few seconds
+    # on cold start). Without the second check, we hit /api/v2/token
+    # while admin-init is still in flight and get 401 → "admin login
+    # failed — default user not created", and the run looks green.
+    SFTPGO_READY=false
+    SFTPGO_PROBE_B64=$(printf '%s' "$SFTPGO_ADMIN_PASS" | base64 | tr -d '\n')
+
+    # /healthz + /api/v2/token probe loop. With ephemeral SFTPGo state
+    # (docker-named-volume, NOT a bind-mount onto /mnt/nexus-data/), the
+    # admin row is freshly bootstrapped from $SFTPGO_DEFAULT_ADMIN_*
+    # on every cold start, so this loop succeeds on the first or
+    # second iteration in practice. The 60×2 s ceiling is just a
+    # defensive cap for the cold-start race between /healthz returning
+    # 200 and the data provider finishing admin-init.
+    for _i in $(seq 1 60); do
+        # `--connect-timeout 3 --max-time 5` mirrors the Kestra
+        # readiness probe — bounds each iteration so a stalled
+        # localhost socket can't make the loop hang past the 60×2 s
+        # ceiling.
+        _ah=$(ssh nexus "curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w '%{http_code}' http://localhost:8090/healthz 2>/dev/null") || true
+        _ah="${_ah:-000}"
+        if [ "$_ah" = "200" ]; then
+            _au=$(ssh nexus "bash -s" <<REMOTE_SFTPGO_PROBE_EOF 2>/dev/null
+PW=\$(printf '%s' '$SFTPGO_PROBE_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'user = "nexus-sftpgo:%s"\n' "\$PW" > "\$CFG"
+curl -s --connect-timeout 3 --max-time 5 -o /dev/null -w '%{http_code}' --config "\$CFG" 'http://localhost:8090/api/v2/token'
+REMOTE_SFTPGO_PROBE_EOF
+) || _au=""
+            _au="${_au:-000}"
+            if [ "$_au" = "200" ]; then
+                SFTPGO_READY=true
+                break
+            fi
+        fi
+        sleep 2
+    done
+
+    if [ "$SFTPGO_READY" = "false" ]; then
+        echo -e "${YELLOW}  ⚠ SFTPGo not ready after probe — skipping default-user creation${NC}"
+    elif [ -z "$R2_DATA_BUCKET" ] || [ -z "$R2_DATA_ENDPOINT" ] || [ -z "$R2_DATA_ACCESS_KEY" ] || [ -z "$R2_DATA_SECRET_KEY" ]; then
+        echo -e "${YELLOW}  ⚠ R2 datalake credentials missing — SFTPGo admin is up, but default user not created (configure manually in the UI)${NC}"
+    else
+        # ----------------------------------------------------------------
+        # Step 1: get an admin JWT. SFTPGo's /api/v2/token endpoint
+        # accepts basic auth; the response carries an `access_token`.
+        #
+        # Both this call (admin password as basic-auth credential) and
+        # Step 2 (bearer token as Authorization header) run inside
+        # `bash -s` heredocs on the remote so no secret transits via
+        # argv. The runner base64-encodes each value, the remote bash
+        # decodes via the `printf` builtin (no fork-exec, no argv) and
+        # writes a mode-600 curl `--config` file. Same argv-safe pattern
+        # the Kestra-bootstrap block uses for INFISICAL_TOKEN/KESTRA_PASS.
+        # ----------------------------------------------------------------
+        SFTPGO_ADMIN_B64=$(printf '%s' "$SFTPGO_ADMIN_PASS" | base64 | tr -d '\n')
+        SFTPGO_TOKEN_RESP=$(ssh nexus "bash -s" <<REMOTE_SFTPGO_TOKEN_EOF 2>/dev/null
+ADMIN_PW=\$(printf '%s' '$SFTPGO_ADMIN_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'user = "nexus-sftpgo:%s"\n' "\$ADMIN_PW" > "\$CFG"
+curl -s --config "\$CFG" 'http://localhost:8090/api/v2/token'
+REMOTE_SFTPGO_TOKEN_EOF
+) || SFTPGO_TOKEN_RESP=""
+        SFTPGO_TOKEN=$(echo "$SFTPGO_TOKEN_RESP" | jq -r '.access_token // empty' 2>/dev/null)
+
+        if [ -z "$SFTPGO_TOKEN" ]; then
+            echo -e "${YELLOW}  ⚠ SFTPGo admin login failed — default user not created${NC}"
+        else
+            # Step 2: create nexus-default with R2 vfs config. provider=1
+            # is SFTPGo's S3 backend (works for any S3-compatible endpoint
+            # including R2). home_dir is virtual, scoped to the user; it
+            # maps onto the bucket prefix below via key_prefix.
+            #
+            # Each input transits as base64 over the heredoc body — no
+            # secret bytes ever appear in argv on either side. On the
+            # runner, the value is fed to `base64` via a pipe (so the
+            # `printf` part is a builtin and the secret reaches `base64`
+            # over stdin, not argv). On the remote shell, the decode uses
+            # the `printf` builtin → `base64 -d` pipe with the same
+            # property. Decoded values are then handed to a remote `jq -n`
+            # invocation via env vars (`env.VAR`) — jq reads them from
+            # its environment, never from argv. The constructed JSON
+            # transits to remote curl via stdin (`--data-binary @-`),
+            # while bearer-token + content-type sit in a mode-600 curl
+            # `--config` file written by the `printf` builtin.
+            SFTPGO_TOKEN_B64=$(printf '%s' "$SFTPGO_TOKEN" | base64 | tr -d '\n')
+            SFTPGO_USER_PASS_B64=$(printf '%s' "$SFTPGO_USER_PASS" | base64 | tr -d '\n')
+
+            # SFTPGo doesn't auto-create the local FS paths it expects:
+            # - home_dir (`/var/lib/sftpgo/users/nexus-default`) is the
+            #   user's local-FS scratch root for files written at path
+            #   "/" (i.e. NOT inside a virtual folder mount).
+            # - mapped_path under each folder (`/var/lib/sftpgo/folders/<name>`)
+            #   is the local "shadow" path SFTPGo uses internally for
+            #   metadata caching even though the actual data is in S3.
+            # Without these, the very first directory listing returns
+            # "Failed to get directory listing" / "lstat: no such file
+            # or directory". Pre-create + chown to the SFTPGo container
+            # uid (1000) before the API calls touch them.
+            # Capture stderr so a real failure (container missing,
+            # docker daemon unhealthy, …) surfaces with the actual
+            # cause rather than being swallowed silently. Subsequent
+            # API calls (folder POST, user POST) will fail downstream
+            # if these dirs aren't there, and "Failed to get directory
+            # listing" 100 lines later is a confusing way to learn the
+            # mkdir step never ran.
+            SFTPGO_PREP_ERR=$(ssh nexus "docker exec --user 0 sftpgo sh -c 'mkdir -p /var/lib/sftpgo/users/nexus-default /var/lib/sftpgo/folders/cloudflare_r2 /var/lib/sftpgo/folders/hetzner_s3 && chown -R 1000:1000 /var/lib/sftpgo/users /var/lib/sftpgo/folders'" 2>&1) || SFTPGO_PREP_ERR_RC=$?
+            if [ -n "${SFTPGO_PREP_ERR_RC:-}" ]; then
+                echo -e "${YELLOW}  ⚠ SFTPGo dir-prep step (mkdir/chown inside the container) failed: $SFTPGO_PREP_ERR${NC}"
+                echo -e "${YELLOW}    → SFTPGo user-creation will likely fail with 'Failed to get directory listing' on first login. Configure manually in the admin UI if needed.${NC}"
+            fi
+            unset SFTPGO_PREP_ERR_RC
+
+            SFTPGO_R2_BUCKET_B64=$(printf '%s' "$R2_DATA_BUCKET" | base64 | tr -d '\n')
+            SFTPGO_R2_ENDPOINT_B64=$(printf '%s' "$R2_DATA_ENDPOINT" | base64 | tr -d '\n')
+            SFTPGO_R2_AK_B64=$(printf '%s' "$R2_DATA_ACCESS_KEY" | base64 | tr -d '\n')
+            SFTPGO_R2_SK_B64=$(printf '%s' "$R2_DATA_SECRET_KEY" | base64 | tr -d '\n')
+
+            # The SFTPGo user gets virtual-folders (one per backend) so
+            # a single SFTP login surfaces multiple object-storage
+            # backends as subdirectories of the user's home:
+            #
+            #   /              local FS (scratch space inside the
+            #                  container, ephemeral by design — see
+            #                  the named-volume rationale at the top of
+            #                  the SFTPGo compose)
+            #   /cloudflare_r2   Cloudflare R2 datalake bucket
+            #   /hetzner_s3      Hetzner Object Storage (only mounted if
+            #                    HETZNER_S3_* secrets are present)
+            #
+            # Operators can add more virtual folders for AWS S3, GCS,
+            # Azure Blob, additional MinIO instances, etc. via the
+            # admin UI — see "Connecting to non-R2 storage" in
+            # docs/stacks/sftpgo.md. The auto-configured pair is just
+            # what we have credentials for at deploy time.
+
+            # Helper 1: POST /api/v2/folders to register a backend
+            # under a friendly name. Idempotent: 201 = created,
+            # 409 = already exists from a previous spin-up. Both fine.
+            #
+            # Args (passed via SFTPGO_FOLDER_* env on the runner side
+            # before invocation):
+            #   $1 = SFTPGO_FOLDER_NAME           — virtual folder name
+            #   $2 = SFTPGO_FOLDER_BUCKET_B64
+            #   $3 = SFTPGO_FOLDER_ENDPOINT_B64
+            #   $4 = SFTPGO_FOLDER_REGION         — plain (not base64'd, no secret)
+            #   $5 = SFTPGO_FOLDER_AK_B64
+            #   $6 = SFTPGO_FOLDER_SK_B64
+            sftpgo_post_folder() {
+                local _name="$1" _bucket_b64="$2" _endpoint_b64="$3" _region="$4" _ak_b64="$5" _sk_b64="$6"
+                ssh nexus "bash -s" <<REMOTE_SFTPGO_FOLDER_EOF 2>/dev/null
+TOKEN=\$(printf '%s' '$SFTPGO_TOKEN_B64' | base64 -d)
+BUCKET=\$(printf '%s' '$_bucket_b64' | base64 -d)
+ENDPOINT=\$(printf '%s' '$_endpoint_b64' | base64 -d)
+AK=\$(printf '%s' '$_ak_b64' | base64 -d)
+SK=\$(printf '%s' '$_sk_b64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "\$TOKEN" > "\$CFG"
+NAME='$_name' BUCKET="\$BUCKET" ENDPOINT="\$ENDPOINT" REGION='$_region' AK="\$AK" SK="\$SK" jq -n '{
+    name: env.NAME,
+    mapped_path: ("/var/lib/sftpgo/folders/" + env.NAME),
+    filesystem: {
+        provider: 1,
+        s3config: {
+            bucket: env.BUCKET,
+            endpoint: env.ENDPOINT,
+            region: env.REGION,
+            access_key: env.AK,
+            access_secret: { payload: env.SK, status: "Plain" },
+            key_prefix: "",
+            force_path_style: true
+        }
+    }
+}' | curl -s -o /dev/null -w '%{http_code}' \\
+    -X POST 'http://localhost:8090/api/v2/folders' \\
+    --config "\$CFG" \\
+    --data-binary @-
+REMOTE_SFTPGO_FOLDER_EOF
+            }
+
+            # Register the R2 virtual folder (always — R2 creds are
+            # required for SFTPGo to be configured at all per the
+            # earlier R2_DATA_* guard).
+            R2_FOLDER_STATUS=$(sftpgo_post_folder \
+                "cloudflare_r2" \
+                "$SFTPGO_R2_BUCKET_B64" \
+                "$SFTPGO_R2_ENDPOINT_B64" \
+                "auto" \
+                "$SFTPGO_R2_AK_B64" \
+                "$SFTPGO_R2_SK_B64") || true
+            R2_FOLDER_STATUS="${R2_FOLDER_STATUS:-000}"
+            case "$R2_FOLDER_STATUS" in
+                201)     echo "    ✓ SFTPGo virtual folder '/cloudflare_r2' registered (R2 datalake)" ;;
+                409)     echo "    ✓ SFTPGo virtual folder '/cloudflare_r2' already exists — left untouched" ;;
+                *)       echo -e "${YELLOW}    ⚠ SFTPGo virtual folder '/cloudflare_r2' POST returned HTTP $R2_FOLDER_STATUS${NC}" ;;
+            esac
+
+            # Optionally register the Hetzner Object Storage folder.
+            # Only the lakefs-bucket (HETZNER_S3_BUCKET) credentials are
+            # always populated by the deploy pipeline; if any of the
+            # five fields is missing (e.g. Hetzner OBS unavailable in
+            # the user's project), we skip the mount. Operators can add
+            # it later via the admin UI.
+            VIRTUAL_FOLDERS_JSON='[{"name":"cloudflare_r2","virtual_path":"/cloudflare_r2","quota_size":-1,"quota_files":-1}]'
+            if [ -n "$HETZNER_S3_BUCKET_GENERAL" ] && [ -n "$HETZNER_S3_SERVER" ] && [ -n "$HETZNER_S3_REGION" ] \
+                && [ -n "$HETZNER_S3_ACCESS_KEY" ] && [ -n "$HETZNER_S3_SECRET_KEY" ]; then
+                HZ_BUCKET_B64=$(printf '%s' "$HETZNER_S3_BUCKET_GENERAL" | base64 | tr -d '\n')
+                HZ_ENDPOINT_B64=$(printf '%s' "$HETZNER_S3_SERVER" | base64 | tr -d '\n')
+                HZ_AK_B64=$(printf '%s' "$HETZNER_S3_ACCESS_KEY" | base64 | tr -d '\n')
+                HZ_SK_B64=$(printf '%s' "$HETZNER_S3_SECRET_KEY" | base64 | tr -d '\n')
+                HZ_FOLDER_STATUS=$(sftpgo_post_folder \
+                    "hetzner_s3" \
+                    "$HZ_BUCKET_B64" \
+                    "$HZ_ENDPOINT_B64" \
+                    "$HETZNER_S3_REGION" \
+                    "$HZ_AK_B64" \
+                    "$HZ_SK_B64") || true
+                HZ_FOLDER_STATUS="${HZ_FOLDER_STATUS:-000}"
+                case "$HZ_FOLDER_STATUS" in
+                    201)     echo "    ✓ SFTPGo virtual folder '/hetzner_s3' registered (Hetzner Object Storage)" ;;
+                    409)     echo "    ✓ SFTPGo virtual folder '/hetzner_s3' already exists — left untouched" ;;
+                    *)       echo -e "${YELLOW}    ⚠ SFTPGo virtual folder '/hetzner_s3' POST returned HTTP $HZ_FOLDER_STATUS${NC}" ;;
+                esac
+                if [ "$HZ_FOLDER_STATUS" = "201" ] || [ "$HZ_FOLDER_STATUS" = "409" ]; then
+                    VIRTUAL_FOLDERS_JSON='[{"name":"cloudflare_r2","virtual_path":"/cloudflare_r2","quota_size":-1,"quota_files":-1},{"name":"hetzner_s3","virtual_path":"/hetzner_s3","quota_size":-1,"quota_files":-1}]'
+                fi
+            else
+                echo "    (Hetzner Object Storage credentials missing — skipping '/hetzner_s3' virtual folder)"
+            fi
+
+            # Helper 2: POST /api/v2/users with a local-FS home and the
+            # registered virtual folders attached. The local home is
+            # ephemeral scratch space; real data sits behind the virtual
+            # folders. SFTPGo materialises home_dir on first login if
+            # missing, so the operator does not have to mkdir it.
+            VIRTUAL_FOLDERS_JSON_B64=$(printf '%s' "$VIRTUAL_FOLDERS_JSON" | base64 | tr -d '\n')
+            sftpgo_post_user() {
+                ssh nexus "bash -s" <<REMOTE_SFTPGO_USER_EOF 2>/dev/null
+TOKEN=\$(printf '%s' '$SFTPGO_TOKEN_B64' | base64 -d)
+SFTP_USER_PASS=\$(printf '%s' '$SFTPGO_USER_PASS_B64' | base64 -d)
+VFOLDERS=\$(printf '%s' '$VIRTUAL_FOLDERS_JSON_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "\$TOKEN" > "\$CFG"
+# All env-vars on a single line as a prefix to \`jq -n\` (see
+# the earlier comment in this file: a comment in the middle of a
+# bash line-continuation chain swallows the prefix and jq runs
+# without env, so all env.X resolve to null → 400).
+PASSWORD="\$SFTP_USER_PASS" VFOLDERS="\$VFOLDERS" jq -n '{
+    username: "nexus-default",
+    password: env.PASSWORD,
+    home_dir: "/var/lib/sftpgo/users/nexus-default",
+    permissions: { "/": ["*"], "/cloudflare_r2": ["*"], "/hetzner_s3": ["*"] },
+    status: 1,
+    filesystem: { provider: 0 },
+    virtual_folders: (env.VFOLDERS | fromjson)
+}' | curl -s -o /dev/null -w '%{http_code}' \\
+    -X POST 'http://localhost:8090/api/v2/users' \\
+    --config "\$CFG" \\
+    --data-binary @-
+REMOTE_SFTPGO_USER_EOF
+            }
+
+            SFTPGO_USER_STATUS=$(sftpgo_post_user) || true
+            SFTPGO_USER_STATUS="${SFTPGO_USER_STATUS:-000}"
+
+            # 201 = freshly created (initial-setup or post-destroy).
+            # 400/409 = SFTPGo's "user already exists" responses on a
+            #           re-run of spin-up against an already-running
+            #           container (named volume preserves the row across
+            #           in-place spin-ups; only destroy-all wipes it
+            #           because that destroys the docker volume too).
+            #           Treat as benign — re-deploys aren't supposed to
+            #           print a yellow warning for a healthy state.
+            case "$SFTPGO_USER_STATUS" in
+                201)     echo -e "${GREEN}  ✓ SFTPGo user 'nexus-default' created with virtual folders (/cloudflare_r2 + /hetzner_s3 if available)${NC}" ;;
+                400|409) echo "  ✓ SFTPGo user 'nexus-default' already exists — left untouched" ;;
+                *)       echo -e "${YELLOW}  ⚠ SFTPGo user creation returned HTTP $SFTPGO_USER_STATUS — configure manually${NC}"
+                         echo -e "${YELLOW}    Credentials available in Infisical${NC}" ;;
+            esac
+        fi
+    fi
+fi
+
 # Configure Metabase admin account
 if echo "$ENABLED_SERVICES" | grep -qw "metabase" && [ -n "$METABASE_PASS" ]; then
     echo "  Configuring Metabase..."
@@ -2738,9 +3244,11 @@ if echo "$ENABLED_SERVICES" | grep -qw "windmill" && [ -n "$WINDMILL_ADMIN_PASS"
             echo -e "${YELLOW}  ⚠ Windmill admin creation: ${WINDMILL_CREATE_RESULT:-no response}${NC}"
         fi
 
-        # --- Step 2: Create regular user for USER_EMAIL (if different from ADMIN_EMAIL) ---
-        if [ -n "$USER_EMAIL" ] && [ "$USER_EMAIL" != "$ADMIN_EMAIL" ]; then
-            WINDMILL_USER_JSON=$(jq -n --arg email "$USER_EMAIL" --arg password "$WINDMILL_ADMIN_PASS" \
+        # --- Step 2: Create regular user for GITEA_USER_EMAIL (if different from ADMIN_EMAIL) ---
+        # Use GITEA_USER_EMAIL (single address) not USER_EMAIL (may be comma list).
+        # Windmill's email field has the same single-value semantics as Gitea's.
+        if [ -n "$GITEA_USER_EMAIL" ] && [ "$GITEA_USER_EMAIL" != "$ADMIN_EMAIL" ]; then
+            WINDMILL_USER_JSON=$(jq -n --arg email "$GITEA_USER_EMAIL" --arg password "$WINDMILL_ADMIN_PASS" \
                 '{email: $email, password: $password, super_admin: false, name: "User"}')
             WINDMILL_USER_RESULT=$(printf '%s' "$WINDMILL_USER_JSON" | ssh nexus "curl -s -X POST '$WM_URL/users/create' \
                 -H '$WM_AUTH' \
@@ -2748,7 +3256,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "windmill" && [ -n "$WINDMILL_ADMIN_PASS"
                 -d @-" 2>/dev/null || echo "")
 
             if echo "$WINDMILL_USER_RESULT" | grep -q '"email"' 2>/dev/null; then
-                echo -e "${GREEN}  ✓ Windmill user created (user: $USER_EMAIL)${NC}"
+                echo -e "${GREEN}  ✓ Windmill user created (user: $GITEA_USER_EMAIL)${NC}"
             elif echo "$WINDMILL_USER_RESULT" | grep -qi 'already exists' 2>/dev/null; then
                 echo -e "${YELLOW}  ⚠ Windmill user already exists${NC}"
             fi
@@ -2942,9 +3450,14 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
         # The PATCH body requires source_id and login_name even for an
         # email-only update — Gitea's admin-users schema rejects partial
         # bodies without them. source_id:0 = local auth provider.
-        if [ "$ADMIN_EXISTS" -gt 0 ] && [ -n "$USER_EMAIL" ]; then
+        if [ "$ADMIN_EXISTS" -gt 0 ] && [ -n "$GITEA_USER_EMAIL" ]; then
             CURRENT_ADMIN_EMAIL=$(printf '%s\n' "$ADMIN_LIST" | awk -v name="$ADMIN_USERNAME" 'NR>1 && $2==name {print $3; exit}')
-            if [ "$CURRENT_ADMIN_EMAIL" = "$USER_EMAIL" ]; then
+            # Compare against GITEA_USER_EMAIL (single address). The admin
+            # row's email column is always a single address; if USER_EMAIL
+            # is a comma-list, a raw equality check would never match and
+            # this remap (Stage 3, v0.51.9) would silently not fire for
+            # upgraded stacks, leaving the legacy collision in place.
+            if [ "$CURRENT_ADMIN_EMAIL" = "$GITEA_USER_EMAIL" ]; then
                 echo "  Admin has legacy email conflicting with user — remapping to $ADMIN_EMAIL..."
                 # --fail-with-body so curl exits non-zero on HTTP 4xx/5xx while
                 # still printing the response body — without it, a Gitea
@@ -2996,9 +3509,11 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
         fi
 
         # --- Create regular user account (for students/user_email) ---
-        # Extract username from user_email (part before @)
-        GITEA_USER_USERNAME="${USER_EMAIL%%@*}"
-        if [ -n "$USER_EMAIL" ] && [ -n "$GITEA_USER_PASS" ]; then
+        # Extract username from the single-address GITEA_USER_EMAIL (see ~line 85).
+        # Gate on GITEA_USER_EMAIL (not raw USER_EMAIL) — empty-after-trim
+        # means no valid single address, so CREATE/SYNC both skip cleanly.
+        GITEA_USER_USERNAME="${GITEA_USER_EMAIL%%@*}"
+        if [ -n "$GITEA_USER_EMAIL" ] && [ -n "$GITEA_USER_PASS" ]; then
             # Same column-exact awk pattern as the admin block above, with the
             # same two-step fetch-then-parse structure. Note that the current
             # `|| echo ""` fallback collapses ssh/list failures into an empty
@@ -3037,7 +3552,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
                 GITEA_USER_RESULT=$(ssh nexus "docker exec -u git gitea gitea admin user create \
                     --username '$GITEA_USER_USERNAME' \
                     --password '$GITEA_USER_PASS' \
-                    --email '$USER_EMAIL' \
+                    --email '$GITEA_USER_EMAIL' \
                     --must-change-password=false" 2>&1 || echo "")
 
                 if echo "$GITEA_USER_RESULT" | grep -qi "created\|success\|New user"; then
@@ -3067,8 +3582,132 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
                 -d '{\"name\":\"nexus-automation\",\"scopes\":[\"all\"]}'" 2>/dev/null | jq -r '.sha1 // empty')
         fi
 
+        # ---------------------------------------------------------------
+        # seed_workspace_files — POST every file under
+        # `examples/workspace-seeds/` into the workspace Gitea repo at
+        # the same relative path. POST returns 422 ("already exists")
+        # for files the user has already touched, which we count as
+        # SKIPPED so user edits persist across re-deploys.
+        #
+        # Called from BOTH branches of the workspace-repo-creation flow:
+        # the non-mirror branch seeds the default `nexus-<slug>-gitea`
+        # repo, the mirror branch seeds each user's fork after it has
+        # been created. The repo PATH owner comes from
+        # `$GITEA_REPO_OWNER` (set per-mode at the top of this script):
+        # admin in non-mirror / mirror-readonly mode, the user's Gitea
+        # username in mirror+user mode. The auth still goes through the
+        # admin token (`$GITEA_TOKEN`) — admin has API access to write
+        # to user forks too.
+        #
+        # Token transits via a curl `--config` file rather than `-H
+        # 'Authorization: token <TOK>'` per request: the latter would
+        # leak the token into the remote `ps` listing for every
+        # iteration of the loop.
+        # ---------------------------------------------------------------
+        seed_workspace_files() {
+            local SEED_DIR="$PROJECT_ROOT/examples/workspace-seeds"
+            if [ ! -d "$SEED_DIR" ] || [ -z "$GITEA_TOKEN" ] || [ -z "$REPO_NAME" ] || [ -z "$GITEA_REPO_OWNER" ]; then
+                return 0
+            fi
+
+            local SEED_COUNT=0 SEED_SKIPPED=0 SEED_FAILED=0
+            local GITEA_CURL_CFG=""
+            local SEED_CFG_READY=false
+
+            GITEA_CURL_CFG=$(ssh nexus 'mktemp' 2>/dev/null) || GITEA_CURL_CFG=""
+            if [ -n "$GITEA_CURL_CFG" ]; then
+                # Register the remote tmp path with the global EXIT trap.
+                echo "$GITEA_CURL_CFG" >> "$REMOTE_CLEANUP_PATHS"
+                if ssh nexus "umask 077 && cat > '$GITEA_CURL_CFG' && chmod 600 '$GITEA_CURL_CFG'" <<CFG 2>/dev/null
+header = "Authorization: token $GITEA_TOKEN"
+CFG
+                then
+                    SEED_CFG_READY=true
+                fi
+            fi
+
+            if [ "$SEED_CFG_READY" != "true" ]; then
+                echo -e "${YELLOW}  ⚠ Skipping workspace seed (ssh setup of remote curl config failed)${NC}"
+                return 0
+            fi
+
+            echo "  Seeding workspace files into ${GITEA_REPO_OWNER}/${REPO_NAME}..."
+            local SEED_FILE REPO_PATH REPO_PATH_ENC CONTENT_B64 JSON_BODY SEED_STATUS SEED_B64_TMP
+            while IFS= read -r -d '' SEED_FILE; do
+                REPO_PATH="${SEED_FILE#$SEED_DIR/}"
+                # Defense in depth — restrict to the safe filesystem
+                # subset (ASCII alphanumerics, dot, dash, underscore,
+                # slash). Closes any shell-injection vector if a future
+                # filename slips a quote / backtick / control char.
+                if ! [[ "$REPO_PATH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+                    echo -e "${YELLOW}    ⚠ Skipping seed with unsafe path: $REPO_PATH${NC}"
+                    SEED_FAILED=$((SEED_FAILED+1))
+                    continue
+                fi
+
+                # URL-encode each path segment via jq @uri.
+                REPO_PATH_ENC=$(jq -rn --arg p "$REPO_PATH" '$p | split("/") | map(@uri) | join("/")')
+
+                # Base64-encode the seed file into a tmpfile and let jq
+                # read it via `--rawfile` (NOT `--arg "$CONTENT"`).
+                # `--arg` passes the value through execve, which is
+                # capped by ARG_MAX (~2 MB on Linux). Notebooks, binary
+                # assets, etc. can easily exceed that — and silently
+                # fail seeding when they do. `--rawfile` reads from
+                # disk, no argv limit. The tmpfile is registered with
+                # the global RUNNER_CLEANUP_PATHS list so an interrupt
+                # between mktemp and the explicit `rm -f` below still
+                # gets it removed via the EXIT trap.
+                SEED_B64_TMP=$(mktemp)
+                echo "$SEED_B64_TMP" >> "$RUNNER_CLEANUP_PATHS"
+                base64 < "$SEED_FILE" | tr -d '\n' > "$SEED_B64_TMP"
+
+                # No `branch:` field — Gitea defaults to the repo's
+                # default branch. Hardcoding `main` would 404 on forks
+                # whose upstream uses `master` (or any other default),
+                # which is a realistic case in GH_MIRROR_REPOS mode.
+                #
+                # Owner is $GITEA_REPO_OWNER, NOT $ADMIN_USERNAME — in
+                # mirror+user mode the workspace is the user's fork.
+                # The constructed JSON streams directly to ssh's stdin
+                # via the pipe (no intermediate variable), so no
+                # buffered $JSON_BODY can hit memory limits either.
+                SEED_STATUS=$(jq -n \
+                    --rawfile content "$SEED_B64_TMP" \
+                    --arg path "$REPO_PATH" \
+                    '{
+                        content: $content,
+                        message: ("chore(seed): add " + $path + " from Nexus-Stack examples/workspace-seeds/")
+                    }' | ssh nexus "curl -s -o /dev/null -w '%{http_code}' \
+                    -X POST 'http://localhost:3200/api/v1/repos/$GITEA_REPO_OWNER/$REPO_NAME/contents/$REPO_PATH_ENC' \
+                    --config '$GITEA_CURL_CFG' \
+                    -H 'Content-Type: application/json' \
+                    --data-binary @-" 2>/dev/null) || true
+                SEED_STATUS="${SEED_STATUS:-000}"
+                rm -f "$SEED_B64_TMP"
+
+                case "$SEED_STATUS" in
+                    201|200) SEED_COUNT=$((SEED_COUNT+1)) ;;
+                    422)     SEED_SKIPPED=$((SEED_SKIPPED+1)) ;;
+                    *)       SEED_FAILED=$((SEED_FAILED+1)) ;;
+                esac
+            done < <(find "$SEED_DIR" -type f -print0 2>/dev/null)
+
+            ssh nexus "rm -f '$GITEA_CURL_CFG'" 2>/dev/null || true
+
+            if [ "$SEED_COUNT" -gt 0 ]; then
+                echo -e "${GREEN}  ✓ Seeded $SEED_COUNT workspace file(s) into Gitea${NC}"
+            fi
+            if [ "$SEED_SKIPPED" -gt 0 ]; then
+                echo -e "${YELLOW}    ($SEED_SKIPPED already existed in Gitea, left untouched)${NC}"
+            fi
+            if [ "$SEED_FAILED" -gt 0 ]; then
+                echo -e "${YELLOW}  ⚠ $SEED_FAILED workspace seed(s) failed (check Gitea logs)${NC}"
+            fi
+        }
+
         if [ -n "$GITEA_TOKEN" ]; then
-            GITEA_USER_USERNAME="${USER_EMAIL%%@*}"
+            GITEA_USER_USERNAME="${GITEA_USER_EMAIL%%@*}"
 
             if [ -z "${GH_MIRROR_REPOS:-}" ]; then
                 # --- Create default empty workspace repo ---
@@ -3110,6 +3749,12 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
                         -d '{\"permission\": \"write\"}'" >/dev/null 2>&1 || true
                     echo -e "${GREEN}  ✓ User '$GITEA_USER_USERNAME' added as collaborator${NC}"
                 fi
+
+                # Seed example workspace files via shared function (also
+                # called from the GH_MIRROR_REPOS branch later in this script
+                # so mirror users get the same starter material). See the
+                # function definition for the full mapping rationale.
+                seed_workspace_files
             fi
 
             # --- Restart services that have Git integration (to pick up .env vars) ---
@@ -3139,44 +3784,698 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" && [ -n "$GITEA_ADMIN_PASS" ]; th
             if echo "$ENABLED_SERVICES" | grep -qw "kestra"; then
                 echo "  Configuring Kestra Git sync..."
 
-                # Wait for Kestra to be ready
+                # Wait for Kestra to be ready. Budget: 60 × ~8 s ≤ 480 s
+                # (~8 min worst case).
+                #
+                # Two corrections from the previous attempt:
+                #
+                # 1. `curl -sf` had no max-time, so when Kestra binds the
+                #    port but the JVM/plugin layer hasn't yet wired up
+                #    request handlers, curl waits the OS-default timeout
+                #    (~75 s) per iteration. The loop was nominally
+                #    60 × 3 s = 180 s but actually ran 268 s in practice
+                #    because curl hung, then we gave up just as Kestra
+                #    was about to be ready. Now: `--connect-timeout 3
+                #    --max-time 5` bounds every iteration to ≤ 8 s
+                #    (5 s curl + 3 s sleep).
+                #
+                # 2. Kestra v1.0 (LTS, all plugins bundled, ~2 GB pull,
+                #    ~4 GB heap) on a fresh-VM cold start needs more than
+                #    just image-pull time: JVM warmup + plugin load can
+                #    push the API-ready point past 5 minutes. 60 × 8 s
+                #    ceiling gives plenty of headroom; the loop exits
+                #    early on the first successful curl, so steady-state
+                #    spin-ups on a warm VM stay fast.
+                #
+                # Timing out here silently skipped GITEA_TOKEN PUT, the
+                # Infisical→Kestra secret sync, and both `system.git-sync`
+                # / `system.flow-sync` registrations — so seeded flows
+                # never got synced.
+                # Readiness check: accept HTTP 200, 401, or 403 as proof
+                # that Kestra is up and responding. The compose-level
+                # `basic-auth` makes `/api/v1/flows` return 401 to an
+                # unauthenticated curl,
+                # so `curl -sf` (fail-on-non-2xx) was treating a perfectly-
+                # ready Kestra as "not ready" and waiting out the entire
+                # loop budget. We don't want to leak the admin password
+                # into argv on the remote (would be visible in `ps`) just
+                # to satisfy the readiness check, so instead we drop `-f`,
+                # capture the HTTP status code, and accept 200/401/403 as
+                # "server is responding". The actual auth'd calls happen
+                # later inside the bash-s heredoc using a curl --config
+                # file. Liveness: print one line every 10 iterations.
                 KESTRA_READY=false
-                for i in $(seq 1 20); do
-                    if ssh nexus "curl -sf http://localhost:8085/api/v1/flows" >/dev/null 2>&1; then
-                        KESTRA_READY=true
-                        break
+                KESTRA_WAIT_START=$SECONDS
+                for i in $(seq 1 60); do
+                    KSTATUS=$(ssh nexus "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 http://localhost:8085/api/v1/flows" 2>/dev/null) || KSTATUS=""
+                    KSTATUS="${KSTATUS:-000}"
+                    case "$KSTATUS" in
+                        200|401|403) KESTRA_READY=true; break ;;
+                    esac
+                    if [ $((i % 10)) -eq 0 ]; then
+                        echo "    ... still waiting for Kestra ($((SECONDS - KESTRA_WAIT_START))s elapsed, last status $KSTATUS, up to ~480s budget)"
                     fi
                     sleep 3
                 done
 
                 if [ "$KESTRA_READY" = "true" ]; then
-                    # Store GITEA_TOKEN as Kestra secret
-                    ssh nexus "curl -sf -X PUT 'http://localhost:8085/api/v1/secrets/system/GITEA_TOKEN' \
-                        -u '${ADMIN_EMAIL}:${KESTRA_PASS}' \
-                        -H 'Content-Type: text/plain' \
-                        -d '$GITEA_TOKEN'" >/dev/null 2>&1 || true
+                    # ----------------------------------------------------------
+                    # Sync Infisical secrets + GITEA_TOKEN into Kestra as
+                    # SECRET_<NAME>=<base64> environment variables.
+                    #
+                    # Architecture note: Kestra OSS does NOT support runtime
+                    # secret writes via API. The `/api/v1/secrets/...` PUT
+                    # we tried in earlier rounds returns 404; the
+                    # `/api/v1/namespaces/<ns>/secrets` GET endpoint reports
+                    # `"readOnly": true`. The only supported secret-feed in
+                    # OSS is the `EnvVarSecretProvider`, which reads
+                    # `SECRET_<NAME>=<base64-value>` env vars at container
+                    # start. So we:
+                    #
+                    #   1. Build SECRET_* lines on the runner (jq is
+                    #      available there; the VM also has jq now via
+                    #      cloud-init + the runtime install check at the
+                    #      top of this script, but the runner-side build
+                    #      keeps the dedupe / collision-warning logic in
+                    #      one place and avoids piping a megabyte of
+                    #      response bodies through ssh stdin per folder).
+                    #      Source = every Infisical folder + root path,
+                    #      so user-added secrets in Infisical's UI surface
+                    #      in Kestra without code changes.
+                    #   2. Add SECRET_GITEA_TOKEN as a special-case (the
+                    #      Gitea API token is generated post-Gitea-start
+                    #      in deploy.sh and is not in Infisical at the
+                    #      time of the build_folder() pushes earlier in
+                    #      this script).
+                    #   3. ssh-append a delimited block to
+                    #      /opt/docker-server/stacks/kestra/.env on the
+                    #      server. The delimiter (`# === BEGIN/END
+                    #      nexus-secret-sync ===`) lets re-runs replace
+                    #      the prior block cleanly instead of duplicating.
+                    #   4. `docker compose up -d --force-recreate kestra`
+                    #      — Kestra reads SECRET_* only at process start,
+                    #      a config-reload signal won't pick them up.
+                    #   5. Re-wait for Kestra ready (auth-aware loop).
+                    #
+                    # Cost: one Kestra cold-start (~2–4 min on warm VM).
+                    # Worth it: this is the ONLY mechanism that actually
+                    # makes `{{ secret('GITEA_TOKEN') }}` resolve in flows.
+                    # ----------------------------------------------------------
+                    KESTRA_SECRETS_TMP=$(mktemp)
+                    # Register with the global RUNNER_CLEANUP_PATHS list
+                    # so the EXIT trap wipes it even when one of the
+                    # `exit 1` paths below fires (sed-cleanup failure,
+                    # Kestra restart timeout, etc.). Without this, a
+                    # mid-flight abort can leave plaintext base64-
+                    # encoded Infisical secrets on the runner FS.
+                    echo "$KESTRA_SECRETS_TMP" >> "$RUNNER_CLEANUP_PATHS"
+                    KSEC_PUSHED=0
+                    KSEC_SKIPPED=0
+                    KSEC_FETCH_FAILED=0
+                    KSEC_COLLISIONS=0
+                    # KSEC_SEEN is allocated only inside the Infisical-guard
+                    # below, so the runner doesn't leak a tmp file on stacks
+                    # where Infisical isn't reachable. The post-guard
+                    # GITEA_TOKEN-special-case at the bottom of this block
+                    # checks `[ -n "$KSEC_SEEN" ] && [ -f ... ]` before
+                    # running awk, so an unset/missing seen-file is safe.
+                    KSEC_SEEN=""
+                    if [ -n "$INFISICAL_TOKEN" ] && [ -n "$PROJECT_ID" ]; then
+                        echo "  Building Kestra secret env from Infisical..."
+                        INFISICAL_ENV_KESTRA="${INFISICAL_ENV:-dev}"
+                        # Two-column file: "<KEY>\t<source-folder>". Used
+                        # both to skip cross-folder duplicates (first-
+                        # folder-wins, deterministic across re-runs) AND
+                        # to surface a collision warning that names BOTH
+                        # source folders so the operator can tell where
+                        # the divergence is.
+                        KSEC_SEEN=$(mktemp)
 
-                    # Create git-sync flow (SyncNamespaceFiles from Gitea)
-                    ssh nexus "curl -sf -X POST 'http://localhost:8085/api/v1/flows' \
-                        -u '${ADMIN_EMAIL}:${KESTRA_PASS}' \
-                        -H 'Content-Type: application/x-yaml' \
-                        -d 'id: git-sync
+                        # All Infisical fetches happen on the server
+                        # (localhost:8070 only listens there) but we need
+                        # jq on the runner to parse the responses. So:
+                        #
+                        #   - The Infisical bearer token, project ID, and
+                        #     env slug are base64-encoded on the runner
+                        #     and substituted into a `bash -s` heredoc
+                        #     body. The remote shell decodes them via
+                        #     the `printf` builtin (no fork-exec, no
+                        #     argv) and writes a mode-600 curl
+                        #     `--config` file with the auth header.
+                        #     Same argv-safe pattern PR #486 established.
+                        #   - Folder name + secretPath transit through
+                        #     `curl --get --data-urlencode ...` so
+                        #     names with whitespace or reserved chars
+                        #     produce valid URLs.
+                        #   - Folder iteration uses `while read` over
+                        #     newline-delimited input — `for X in $LIST`
+                        #     would word-split on whitespace.
+                        INF_TOKEN_B64=$(printf '%s' "$INFISICAL_TOKEN" | base64 | tr -d '\n')
+                        INF_PID_B64=$(printf '%s' "$PROJECT_ID" | base64 | tr -d '\n')
+                        INF_ENV_B64=$(printf '%s' "$INFISICAL_ENV_KESTRA" | base64 | tr -d '\n')
+
+                        # Each Infisical fetch (folders + per-path
+                        # secrets) needs to surface the HTTP status. We
+                        # use `curl -w "\n%{http_code}"` so the LAST line
+                        # of stdout is the status code; everything before
+                        # it is the response body. Runner-side splits
+                        # status from body and warns on non-200 instead
+                        # of silently feeding a 401/403/error JSON to jq.
+
+                        # 1a. Discover folders. Tempfile around the
+                        #     heredoc to avoid the awkward bash quirk where
+                        #     `$(... <<EOF body EOF)` parses the closing
+                        #     `)` of `$()` BEFORE the heredoc body, mis-
+                        #     matching parens against the `\$(printf ...)`
+                        #     escapes inside the body.
+                        FOLDERS_RAW_FILE=$(mktemp)
+                        ssh nexus "bash -s" > "$FOLDERS_RAW_FILE" 2>/dev/null <<REMOTE_INF_FOLDERS_EOF || true
+ITOK=\$(printf '%s' '$INF_TOKEN_B64' | base64 -d)
+PID=\$(printf '%s' '$INF_PID_B64' | base64 -d)
+INF_ENV=\$(printf '%s' '$INF_ENV_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'header = "Authorization: Bearer %s"\n' "\$ITOK" > "\$CFG"
+curl -s -w "\n%{http_code}" --config "\$CFG" --get \\
+    --data-urlencode "workspaceId=\$PID" \\
+    --data-urlencode "environment=\$INF_ENV" \\
+    --data-urlencode "path=/" \\
+    "http://localhost:8070/api/v1/folders"
+REMOTE_INF_FOLDERS_EOF
+                        FOLDERS_RAW=$(cat "$FOLDERS_RAW_FILE")
+                        rm -f "$FOLDERS_RAW_FILE"
+                        # Last line = HTTP status; everything before = body.
+                        FOLDERS_STATUS=$(printf '%s' "$FOLDERS_RAW" | tail -n1)
+                        FOLDERS_STATUS="${FOLDERS_STATUS:-000}"
+                        FOLDERS_BODY=$(mktemp)
+                        printf '%s' "$FOLDERS_RAW" | sed '$d' > "$FOLDERS_BODY"
+                        if [ "$FOLDERS_STATUS" = "200" ]; then
+                            # Sort the folder list alphabetically so the
+                            # first-folder-wins collision policy is
+                            # deterministic across re-runs even if
+                            # Infisical's API returns folders in a
+                            # different order between calls.
+                            FOLDER_LIST=$(jq -r '.folders[]?.name' "$FOLDERS_BODY" 2>/dev/null | LC_ALL=C sort || echo "")
+                        else
+                            echo -e "${YELLOW}    ⚠ Infisical folder discovery returned HTTP $FOLDERS_STATUS — Kestra secret env will only contain root-path secrets + GITEA_TOKEN${NC}"
+                            KSEC_FETCH_FAILED=$((KSEC_FETCH_FAILED+1))
+                            FOLDER_LIST=""
+                        fi
+                        rm -f "$FOLDERS_BODY"
+
+                        # 1b. For each discovered folder + the root path,
+                        #     fetch all (key, value) pairs. Newline-safe
+                        #     iteration via while-read; secretPath URL-
+                        #     encoded via curl --data-urlencode.
+                        # Use a literal "/" as the root-path sentinel
+                        # rather than a magic name like "__root__". Infisical
+                        # folder names cannot contain a slash (it's the path
+                        # separator, not a name character), so "/" is
+                        # guaranteed not to collide with any real folder
+                        # name an operator might create.
+                        while IFS= read -r FOLDER; do
+                            [ -z "$FOLDER" ] && continue
+                            if [ "$FOLDER" = "/" ]; then
+                                SECRET_PATH="/"
+                                FOLDER_LABEL="<root>"
+                            else
+                                SECRET_PATH="/$FOLDER"
+                                FOLDER_LABEL="$FOLDER"
+                            fi
+                            INF_PATH_B64=$(printf '%s' "$SECRET_PATH" | base64 | tr -d '\n')
+                            # Same tempfile-around-heredoc pattern as the
+                            # folder-discovery call above (avoids paren
+                            # mismatch in `$(... <<EOF \$(...) EOF)`).
+                            SECRETS_RAW_FILE=$(mktemp)
+                            # Plaintext Infisical secrets land in this
+                            # file on the runner; register it with the
+                            # global RUNNER_CLEANUP_PATHS list so an
+                            # interrupted run still wipes it. The
+                            # explicit `rm -f "$SECRETS_RAW_FILE"` below
+                            # remains the happy-path cleanup.
+                            echo "$SECRETS_RAW_FILE" >> "$RUNNER_CLEANUP_PATHS"
+                            ssh nexus "bash -s" > "$SECRETS_RAW_FILE" 2>/dev/null <<REMOTE_INF_SECRETS_EOF || true
+ITOK=\$(printf '%s' '$INF_TOKEN_B64' | base64 -d)
+PID=\$(printf '%s' '$INF_PID_B64' | base64 -d)
+INF_ENV=\$(printf '%s' '$INF_ENV_B64' | base64 -d)
+SPATH=\$(printf '%s' '$INF_PATH_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'header = "Authorization: Bearer %s"\n' "\$ITOK" > "\$CFG"
+curl -s -w "\n%{http_code}" --config "\$CFG" --get \\
+    --data-urlencode "workspaceId=\$PID" \\
+    --data-urlencode "environment=\$INF_ENV" \\
+    --data-urlencode "secretPath=\$SPATH" \\
+    "http://localhost:8070/api/v3/secrets/raw"
+REMOTE_INF_SECRETS_EOF
+                            SECRETS_RAW=$(cat "$SECRETS_RAW_FILE")
+                            rm -f "$SECRETS_RAW_FILE"
+                            SECRETS_STATUS=$(printf '%s' "$SECRETS_RAW" | tail -n1)
+                            SECRETS_STATUS="${SECRETS_STATUS:-000}"
+                            SECRETS_BODY=$(mktemp)
+                            # Plaintext Infisical secret values (after we
+                            # split off the trailing HTTP status line)
+                            # land in this tmp on the runner; register it
+                            # with RUNNER_CLEANUP_PATHS so an interrupted
+                            # run still wipes it. Both happy-path
+                            # `rm -f "$SECRETS_BODY"` calls below remain
+                            # as immediate cleanup.
+                            echo "$SECRETS_BODY" >> "$RUNNER_CLEANUP_PATHS"
+                            printf '%s' "$SECRETS_RAW" | sed '$d' > "$SECRETS_BODY"
+                            if [ "$SECRETS_STATUS" != "200" ]; then
+                                echo -e "${YELLOW}    ⚠ Infisical fetch '$FOLDER_LABEL' (path=$SECRET_PATH) returned HTTP $SECRETS_STATUS — secrets from this folder will be missing in Kestra${NC}"
+                                KSEC_FETCH_FAILED=$((KSEC_FETCH_FAILED+1))
+                                rm -f "$SECRETS_BODY"
+                                continue
+                            fi
+
+                            # jq base64-encodes the secretValue so newlines
+                            # / tabs / binary content (multi-line PEMs)
+                            # survive the TSV transit. Validate the
+                            # response shape before parsing — Infisical
+                            # occasionally returns a non-JSON error body
+                            # with HTTP 200 (e.g. mid-restart) or a JSON
+                            # blob without a `.secrets` array, and a
+                            # silently-empty TSV would skip the whole
+                            # folder without bumping KSEC_FETCH_FAILED.
+                            JQ_TSV_TMP=$(mktemp)
+                            echo "$JQ_TSV_TMP" >> "$RUNNER_CLEANUP_PATHS"
+                            if ! jq -er '.secrets | type == "array"' "$SECRETS_BODY" >/dev/null 2>&1; then
+                                echo -e "${YELLOW}    ⚠ Infisical fetch '$FOLDER_LABEL' (path=$SECRET_PATH) returned HTTP 200 but the body has no \`.secrets\` array — secrets from this folder will be missing in Kestra${NC}"
+                                KSEC_FETCH_FAILED=$((KSEC_FETCH_FAILED+1))
+                                rm -f "$SECRETS_BODY" "$JQ_TSV_TMP"
+                                continue
+                            fi
+                            jq -r '.secrets[]? | [.secretKey, (.secretValue | @base64)] | @tsv' "$SECRETS_BODY" > "$JQ_TSV_TMP" 2>/dev/null || JQ_TSV_RC=$?
+                            if [ -n "${JQ_TSV_RC:-}" ]; then
+                                echo -e "${YELLOW}    ⚠ Infisical fetch '$FOLDER_LABEL' (path=$SECRET_PATH) parsed as JSON but jq tsv-extract failed (exit $JQ_TSV_RC) — secrets from this folder will be missing in Kestra${NC}"
+                                KSEC_FETCH_FAILED=$((KSEC_FETCH_FAILED+1))
+                                rm -f "$SECRETS_BODY" "$JQ_TSV_TMP"
+                                unset JQ_TSV_RC
+                                continue
+                            fi
+                            while IFS=$'\t' read -r KEY VALUE_B64; do
+                                [ -z "$KEY" ] && continue
+                                # Kestra naming rule: ^[A-Za-z][A-Za-z0-9_]*$
+                                # Anything else (slashes, dots, hyphens) won't
+                                # produce a valid `SECRET_<NAME>` env var name.
+                                if ! [[ "$KEY" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+                                    KSEC_SKIPPED=$((KSEC_SKIPPED+1))
+                                    continue
+                                fi
+                                # Cross-folder dedupe (first-folder-wins is
+                                # deterministic across repeat runs; last-
+                                # wins would flip env-var values based on
+                                # iteration order). On collision: log a
+                                # warning naming the kept folder and the
+                                # dropped folder so the operator can spot
+                                # divergent values across folders.
+                                EXISTING_FOLDER=$(awk -F'\t' -v k="$KEY" '$1 == k {print $2; exit}' "$KSEC_SEEN" 2>/dev/null)
+                                if [ -n "$EXISTING_FOLDER" ]; then
+                                    echo -e "${YELLOW}    ⚠ Key collision: '$KEY' in folder '$FOLDER_LABEL' shadowed by earlier value from folder '$EXISTING_FOLDER' (first-wins)${NC}"
+                                    KSEC_COLLISIONS=$((KSEC_COLLISIONS+1))
+                                    continue
+                                fi
+                                printf '%s\t%s\n' "$KEY" "$FOLDER_LABEL" >> "$KSEC_SEEN"
+                                echo "SECRET_${KEY}=${VALUE_B64}" >> "$KESTRA_SECRETS_TMP"
+                                KSEC_PUSHED=$((KSEC_PUSHED+1))
+                            done < "$JQ_TSV_TMP"
+                            rm -f "$SECRETS_BODY" "$JQ_TSV_TMP"
+                        done < <(printf '%s\n/\n' "$FOLDER_LIST")
+                    fi
+
+                    # 2. Special case: GITEA_TOKEN is generated by deploy.sh
+                    #    after Gitea boots (it's the on-the-fly admin token
+                    #    used to create the workspace repo). It is NOT in
+                    #    Infisical at the time of the `build_folder()`
+                    #    pushes earlier in this script, so we add it here
+                    #    so seeded flows can use `{{ secret('GITEA_TOKEN') }}`.
+                    # Write SECRET_GITEA_TOKEN unless it was already
+                    # pushed via Infisical (guard against duplicate). The
+                    # awk dedupe-check only runs when KSEC_SEEN was
+                    # actually populated by the Infisical loop above; on
+                    # stacks where Infisical isn't reachable, the file
+                    # doesn't exist and we just write the token directly.
+                    if [ -n "$GITEA_TOKEN" ]; then
+                        ALREADY_HAVE_GITEA_TOKEN=false
+                        if [ -n "$KSEC_SEEN" ] && [ -f "$KSEC_SEEN" ]; then
+                            if awk -F'\t' '$1 == "GITEA_TOKEN" {found=1; exit} END {exit !found}' "$KSEC_SEEN" 2>/dev/null; then
+                                ALREADY_HAVE_GITEA_TOKEN=true
+                            fi
+                        fi
+                        if [ "$ALREADY_HAVE_GITEA_TOKEN" = "false" ]; then
+                            # Encode in a separate var rather than inline `$(…)` —
+                            # nested double quotes inside `$()` are valid bash
+                            # (the inner context is independent), but Copilot
+                            # repeatedly flagged it as ambiguous; the two-line
+                            # form costs nothing and silences the false positive.
+                            GITEA_TOKEN_B64=$(printf '%s' "$GITEA_TOKEN" | base64 | tr -d '\n')
+                            printf 'SECRET_GITEA_TOKEN=%s\n' "$GITEA_TOKEN_B64" >> "$KESTRA_SECRETS_TMP"
+                            KSEC_PUSHED=$((KSEC_PUSHED+1))
+                        fi
+                    fi
+                    [ -n "$KSEC_SEEN" ] && rm -f "$KSEC_SEEN"
+
+                    # 3. Append (or replace) the delimited block in
+                    #    Kestra's .env on the server. Fail fast if either
+                    #    the .env file is missing or the sed-based block
+                    #    removal fails — silently continuing would let
+                    #    SECRET_* entries accumulate across re-runs (or
+                    #    write to a non-existent file), and the operator
+                    #    has no way to notice unless secrets eventually
+                    #    fail at flow execution time.
+                    if [ -s "$KESTRA_SECRETS_TMP" ]; then
+                        if ! ssh nexus "
+                            set -e
+                            ENV_FILE=/opt/docker-server/stacks/kestra/.env
+                            if [ ! -f \"\$ENV_FILE\" ]; then
+                                echo \"ERROR: Kestra .env not found at \$ENV_FILE\" >&2
+                                exit 1
+                            fi
+                            sed -i '/^# === BEGIN nexus-secret-sync/,/^# === END nexus-secret-sync/d' \"\$ENV_FILE\"
+                        "; then
+                            echo -e "${RED}Error: failed to clean previous nexus-secret-sync block from Kestra .env. Aborting deploy to avoid duplicating SECRET_* lines.${NC}"
+                            exit 1
+                        fi
+
+                        # Lock the .env to mode 0600 BEFORE appending the
+                        # SECRET_* block, then append. Doing chmod first
+                        # closes the race window where the file could be
+                        # world-readable (0644 from rsync-preserved modes
+                        # under default umask) WHILE the new secrets are
+                        # being written — a concurrent reader could grab
+                        # a partial copy of base64-encoded R2 keys / DB
+                        # passwords / GITEA_TOKEN. chmod 600 idempotent
+                        # at the start; the file definitely exists
+                        # because the preceding sed-removal step opened
+                        # and re-wrote it.
+                        if ! {
+                            echo "# === BEGIN nexus-secret-sync (re-generated each spin-up; do not edit by hand) ==="
+                            cat "$KESTRA_SECRETS_TMP"
+                            echo "# === END nexus-secret-sync ==="
+                        } | ssh nexus "
+                            set -e
+                            ENV_FILE=/opt/docker-server/stacks/kestra/.env
+                            chmod 600 \"\$ENV_FILE\"
+                            cat >> \"\$ENV_FILE\"
+                        "; then
+                            echo -e "${RED}Error: failed to chmod 0600 + append nexus-secret-sync block to Kestra .env.${NC}"
+                            exit 1
+                        fi
+
+                        if [ "$KSEC_FETCH_FAILED" -gt 0 ]; then
+                            echo -e "${YELLOW}  ⚠ Wrote $KSEC_PUSHED Kestra SECRET_* env-vars to .env (skipped=$KSEC_SKIPPED invalid keys, collisions=$KSEC_COLLISIONS, $KSEC_FETCH_FAILED Infisical fetches failed — secret set is incomplete)${NC}"
+                        elif [ "$KSEC_COLLISIONS" -gt 0 ]; then
+                            echo -e "${YELLOW}  ⚠ Wrote $KSEC_PUSHED Kestra SECRET_* env-vars to .env (skipped=$KSEC_SKIPPED invalid keys, $KSEC_COLLISIONS cross-folder collisions — see warnings above; first-folder-wins applied)${NC}"
+                        else
+                            echo -e "${GREEN}  ✓ Wrote $KSEC_PUSHED Kestra SECRET_* env-vars to .env (skipped=$KSEC_SKIPPED invalid keys)${NC}"
+                        fi
+
+                        # 4. Force-recreate Kestra so the env vars get
+                        #    loaded. `up -d --force-recreate <svc>` keeps
+                        #    other containers untouched. Fail-fast: if
+                        #    the restart fails, the new SECRET_* values
+                        #    are sitting in .env but the live container
+                        #    is still running with the old set — flow-
+                        #    sync registration would proceed against a
+                        #    Kestra that can't resolve `{{ secret('GITEA_TOKEN') }}`.
+                        echo "  Restarting Kestra to load secrets..."
+                        if ! ssh nexus "cd $REMOTE_STACKS_DIR/kestra && docker compose up -d --force-recreate kestra" >/dev/null 2>&1; then
+                            echo -e "${RED}Error: docker compose up -d --force-recreate kestra failed. Aborting deploy to avoid continuing with un-reloaded secrets.${NC}"
+                            exit 1
+                        fi
+
+                        # 5. Re-wait for Kestra to come back up — and
+                        #    actually authenticate. The previous version
+                        #    accepted 401/403 as "responding", which is
+                        #    fine to know the HTTP server is up but does
+                        #    NOT guarantee the basic-auth layer has
+                        #    finished loading the password from the env-
+                        #    var secret store. Hitting POST /api/v1/flows
+                        #    while basic-auth is still initialising → 401
+                        #    → "Kestra Git sync flow registration had
+                        #    failures" even though the password is right.
+                        #
+                        #    Probe with the actual admin creds (basic auth
+                        #    via curl --config) and require 200 before we
+                        #    consider Kestra ready for registration.
+                        echo "  Waiting for Kestra to come back up..."
+                        KESTRA_READY=false
+                        KESTRA_WAIT_START=$SECONDS
+                        KESTRA_PROBE_USER_B64=$(printf '%s' "$ADMIN_EMAIL" | base64 | tr -d '\n')
+                        KESTRA_PROBE_PW_B64=$(printf '%s' "$KESTRA_PASS" | base64 | tr -d '\n')
+                        for i in $(seq 1 60); do
+                            KSTATUS=$(ssh nexus "bash -s" <<REMOTE_KESTRA_PROBE_EOF 2>/dev/null
+USER=\$(printf '%s' '$KESTRA_PROBE_USER_B64' | base64 -d)
+PW=\$(printf '%s' '$KESTRA_PROBE_PW_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'user = "%s:%s"\n' "\$USER" "\$PW" > "\$CFG"
+curl -s -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 --config "\$CFG" 'http://localhost:8085/api/v1/flows'
+REMOTE_KESTRA_PROBE_EOF
+) || KSTATUS=""
+                            KSTATUS="${KSTATUS:-000}"
+                            # Treat Kestra as ready only on known auth-
+                            # success statuses for this probe. /api/v1/flows
+                            # in Kestra v1.0 OSS responds 404 to GET (the
+                            # endpoint only accepts POST, with the read
+                            # path moved under tenant prefix at
+                            # /api/v1/main/flows that returns 405 for GET).
+                            # Both 404 and 405 mean basic-auth was accepted.
+                            # 401 = auth not yet wired; 000 = curl couldn't
+                            # talk to Kestra; 5xx = Kestra reachable but
+                            # internal-error during startup → keep looping.
+                            case "$KSTATUS" in
+                                200|404|405) KESTRA_READY=true; break ;;
+                            esac
+                            if [ $((i % 10)) -eq 0 ]; then
+                                echo "    ... still waiting for Kestra restart + auth ($((SECONDS - KESTRA_WAIT_START))s elapsed, last status $KSTATUS)"
+                            fi
+                            sleep 3
+                        done
+
+                        if [ "$KESTRA_READY" != "true" ]; then
+                            echo -e "${YELLOW}  ⚠ Kestra did not come back up after restart — Git sync flow registration will be skipped${NC}"
+                        fi
+                    else
+                        echo -e "${YELLOW}  ⚠ No Kestra SECRET_* lines built (Infisical empty or unreachable, GITEA_TOKEN missing) — flows that reference {{ secret('NAME') }} will fail${NC}"
+                    fi
+                    rm -f "$KESTRA_SECRETS_TMP"
+                fi  # close: KESTRA_READY initial check
+
+                # ----------------------------------------------------------
+                # Register Git-sync + flow-sync flows. Runs only if Kestra
+                # is reachable (initial wait passed and the post-restart
+                # wait either succeeded or wasn't needed).
+                # ----------------------------------------------------------
+                if [ "$KESTRA_READY" = "true" ]; then
+                    # ----------------------------------------------------------
+                    # Register both Git-sync flows in a single remote bash
+                    # invocation:
+                    #
+                    #   - `git-sync` (SyncNamespaceFiles): pulls helper files
+                    #     (Python scripts, configs, SQL templates) from the
+                    #     repo's `kestra/workflows/` directory into the
+                    #     namespace's files area — these are NOT flow defs.
+                    #
+                    #   - `flow-sync` (SyncFlows): pulls flow YAML files from
+                    #     `kestra/flows/` and registers them under namespace
+                    #     `nexus-tutorials`. `targetNamespace: nexus-tutorials` is
+                    #     required by the v1.0 plugin (without it, POST /flows
+                    #     returns 422 "tasks[0].targetNamespace: must not be
+                    #     null"). With `includeChildNamespaces: true`, subdirs
+                    #     extend the namespace — e.g.
+                    #     `kestra/flows/sub1/foo.yaml` → `nexus-tutorials.sub1`.
+                    #     `delete: true` makes Git the single source of truth
+                    #     — UI-only flows get cleaned up on every sync. This
+                    #     is the persistence layer that survives destroy-all
+                    #     (Gitea repos live on the persistent Hetzner volume
+                    #     `/mnt/nexus-data/gitea/`).
+                    #
+                    # Kestra creds go through a curl --config file written
+                    # via cat-from-stdin instead of `-u user:pw` which would
+                    # expose KESTRA_PASS in the remote `ps` listing. HTTP
+                    # status is captured per flow with a POST→PUT fallback
+                    # for idempotent re-runs (Kestra v1.0 OSS has no upsert
+                    # verb — POST is create-only, PUT is update-only):
+                    #   POST 200/201            → created (first-time)
+                    #   POST 422 → PUT 200/201  → updated (idempotent re-run,
+                    #                              also picks up YAML changes)
+                    #   anything else           → real failure, surfaced as
+                    #                              warning
+                    # ----------------------------------------------------------
+                    REGISTER_USER_B64=$(printf '%s' "$ADMIN_EMAIL" | base64 | tr -d '\n')
+                    REGISTER_PW_B64=$(printf '%s' "$KESTRA_PASS" | base64 | tr -d '\n')
+                    if ssh nexus "bash -s" <<REMOTE_REGISTER_EOF
+set -o pipefail
+KESTRA_USER=\$(printf '%s' '$REGISTER_USER_B64' | base64 -d)
+KESTRA_PW=\$(printf '%s' '$REGISTER_PW_B64' | base64 -d)
+
+KCFG=\$(mktemp)
+chmod 600 "\$KCFG"
+trap 'rm -f "\$KCFG"' EXIT
+printf 'user = "%s:%s"\n' "\$KESTRA_USER" "\$KESTRA_PW" > "\$KCFG"
+
+# Kestra v1.0 has split create/update semantics:
+#   POST /api/v1/flows               → creates new; returns 422 with
+#                                       body "Flow id already exists"
+#                                       when the flow is already there.
+#   PUT  /api/v1/flows/{ns}/{id}     → updates existing; returns 404
+#                                       if the flow doesn't exist yet.
+# Neither verb alone is upsert. So: try POST first; on 422, fall back to PUT.
+# This is what makes the registration idempotent across re-runs AND lets
+# us push schema changes (e.g. adding \`targetNamespace\` to flow-sync)
+# without having to manually delete the old flow first.
+register_flow() {
+    local FLOW_NAME="\$1"
+    local FLOW_BODY="\$2"
+    local STATUS
+    # \`|| true\` instead of \`|| echo "000"\` — see SEED_STATUS comment
+    # in the runner-side block; the latter would concatenate a second
+    # "000" onto curl's own "000" when the connection fails.
+    STATUS=\$(printf '%s' "\$FLOW_BODY" | curl -s -o /dev/null -w '%{http_code}' \\
+        -X POST 'http://localhost:8085/api/v1/flows' \\
+        --config "\$KCFG" \\
+        -H 'Content-Type: application/x-yaml' \\
+        --data-binary @- 2>/dev/null) || true
+    STATUS="\${STATUS:-000}"
+    case "\$STATUS" in
+        200|201)
+            echo "    ✓ \$FLOW_NAME registered (HTTP \$STATUS)" >&2
+            return 0
+            ;;
+        422)
+            # "Flow id already exists" is the idempotent re-run case.
+            # Update with PUT instead. FLOW_NAME format is "ns.id".
+            local NS="\${FLOW_NAME%.*}" ID="\${FLOW_NAME##*.}" PUT_STATUS
+            PUT_STATUS=\$(printf '%s' "\$FLOW_BODY" | curl -s -o /dev/null -w '%{http_code}' \\
+                -X PUT "http://localhost:8085/api/v1/flows/\$NS/\$ID" \\
+                --config "\$KCFG" \\
+                -H 'Content-Type: application/x-yaml' \\
+                --data-binary @- 2>/dev/null) || true
+            PUT_STATUS="\${PUT_STATUS:-000}"
+            case "\$PUT_STATUS" in
+                200|201)
+                    echo "    ✓ \$FLOW_NAME updated (POST 422 → PUT \$PUT_STATUS, idempotent re-run)" >&2
+                    return 0
+                    ;;
+                *)
+                    echo "    ⚠ \$FLOW_NAME update failed (POST 422 → PUT \$PUT_STATUS)" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            echo "    ⚠ \$FLOW_NAME registration failed (HTTP \$STATUS)" >&2
+            return 1
+            ;;
+    esac
+}
+
+REGISTER_FAILED=0
+register_flow "system.git-sync" 'id: git-sync
 namespace: system
 tasks:
   - id: sync
     type: io.kestra.plugin.git.SyncNamespaceFiles
-    url: http://gitea:3000/${ADMIN_USERNAME}/${REPO_NAME}.git
-    branch: main
+    url: http://gitea:3000/${GITEA_REPO_OWNER}/${REPO_NAME}.git
+    branch: ${WORKSPACE_BRANCH}
     username: ${ADMIN_USERNAME}
-    password: \"{{ secret('\''GITEA_TOKEN'\'') }}\"
-    namespace: \"{{ flow.namespace }}\"
-    gitDirectory: workflows
+    password: "{{ secret('\''GITEA_TOKEN'\'') }}"
+    namespace: "{{ flow.namespace }}"
+    gitDirectory: kestra/workflows
 triggers:
   - id: schedule
     type: io.kestra.core.models.triggers.types.Schedule
-    cron: \"*/15 * * * *\"'" >/dev/null 2>&1 || true
+    cron: "*/15 * * * *"' || REGISTER_FAILED=\$((REGISTER_FAILED+1))
 
-                    echo -e "${GREEN}  ✓ Kestra Git sync flow created${NC}"
+register_flow "system.flow-sync" 'id: flow-sync
+namespace: system
+description: Pull flow definitions from internal Gitea, register them in Kestra. Git is source of truth.
+tasks:
+  - id: sync
+    type: io.kestra.plugin.git.SyncFlows
+    url: http://gitea:3000/${GITEA_REPO_OWNER}/${REPO_NAME}.git
+    branch: ${WORKSPACE_BRANCH}
+    username: ${ADMIN_USERNAME}
+    password: "{{ secret('\''GITEA_TOKEN'\'') }}"
+    gitDirectory: kestra/flows
+    targetNamespace: nexus-tutorials
+    includeChildNamespaces: true
+    delete: true
+triggers:
+  - id: schedule
+    type: io.kestra.core.models.triggers.types.Schedule
+    cron: "*/15 * * * *"' || REGISTER_FAILED=\$((REGISTER_FAILED+1))
+
+# ----------------------------------------------------------------
+# Verify the seeded flow actually lands in Kestra.
+#
+# Without this, system.flow-sync only runs on its 15-min cron, so
+# the nexus-tutorials.r2-taxi-pipeline flow doesn't appear in Kestra until
+# the next tick — long after deploy.sh prints "Deployment Complete".
+# Operators reasonably expect the flow to be there immediately and
+# we've already burned cycles debugging "where's the flow?" twice
+# this PR. So: kick one manual execution of system.flow-sync, poll
+# its state up to 60 s, then GET the seeded flow's path. Each step
+# warns clearly if it didn't pan out instead of failing the deploy
+# (the operator can always Execute system.flow-sync manually from
+# the UI as a fallback).
+if [ "\$REGISTER_FAILED" -eq 0 ]; then
+    EXEC_RESP=\$(curl -s --config "\$KCFG" \\
+        -X POST 'http://localhost:8085/api/v1/executions/system/flow-sync' 2>/dev/null) || EXEC_RESP=""
+    EXEC_ID=\$(echo "\$EXEC_RESP" | jq -r '.id // empty' 2>/dev/null)
+
+    if [ -z "\$EXEC_ID" ]; then
+        echo "    ⚠ Could not trigger system.flow-sync execution — first sync will run on the next 15-min cron tick" >&2
+    else
+        # flow-sync = git clone of the workspace repo + a handful of
+        # API calls; usually ~5–10 s. Cap at 30 × 2 s = 60 s.
+        SYNC_STATE=""
+        for poll in \$(seq 1 30); do
+            SYNC_STATE=\$(curl -s --config "\$KCFG" \\
+                "http://localhost:8085/api/v1/executions/\$EXEC_ID" 2>/dev/null \\
+                | jq -r '.state.current // empty' 2>/dev/null)
+            case "\$SYNC_STATE" in
+                SUCCESS|FAILED|KILLED) break ;;
+            esac
+            sleep 2
+        done
+
+        case "\$SYNC_STATE" in
+            SUCCESS)
+                # The flow should now be in Kestra under namespace nexus-tutorials.
+                SEED_FLOW_STATUS=\$(curl -s -o /dev/null -w '%{http_code}' \\
+                    --config "\$KCFG" \\
+                    'http://localhost:8085/api/v1/flows/nexus-tutorials/r2-taxi-pipeline' 2>/dev/null) || true
+                SEED_FLOW_STATUS="\${SEED_FLOW_STATUS:-000}"
+                if [ "\$SEED_FLOW_STATUS" = "200" ]; then
+                    echo "    ✓ Seeded flow nexus-tutorials.r2-taxi-pipeline registered in Kestra" >&2
+                else
+                    echo "    ⚠ system.flow-sync ran but nexus-tutorials.r2-taxi-pipeline is not visible (HTTP \$SEED_FLOW_STATUS) — check that kestra/flows/r2-taxi-pipeline.yaml is in the workspace repo and re-execute system.flow-sync from the Kestra UI" >&2
+                fi
+                ;;
+            FAILED|KILLED)
+                echo "    ⚠ system.flow-sync execution \$SYNC_STATE — open the execution in the Kestra UI for the error log" >&2
+                ;;
+            *)
+                echo "    ⚠ system.flow-sync did not complete within 60 s (state=\$SYNC_STATE) — first regular cron tick will retry within 15 min" >&2
+                ;;
+        esac
+    fi
+fi
+
+[ "\$REGISTER_FAILED" -eq 0 ] || exit 1
+exit 0
+REMOTE_REGISTER_EOF
+                    then
+                        echo -e "${GREEN}  ✓ Kestra Git sync flows created (workflows + flows)${NC}"
+                    else
+                        echo -e "${YELLOW}  ⚠ Kestra Git sync flow registration had failures (check log above)${NC}"
+                    fi
                 else
                     echo -e "${YELLOW}  ⚠ Kestra not ready - skipping Git sync flow${NC}"
                 fi
@@ -3201,7 +4500,7 @@ triggers:
                     -H 'Content-Type: application/json' \
                     -d '{
                         \"name\": \"Woodpecker CI\",
-                        \"redirect_uris\": [\"https://woodpecker-stefan-hslu.nona.company/authorize\"],
+                        \"redirect_uris\": [\"https://woodpecker.${DOMAIN}/authorize\"],
                         \"confidential_client\": true
                     }'" 2>/dev/null || echo "")
 
@@ -3389,12 +4688,38 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" \
                     # Wait briefly for mirror sync to complete
                     sleep 3
 
-                    # Merge upstream into fork (fast-forward)
-                    MERGE_RESULT=$(ssh nexus "curl -s -o /dev/null -w '%{http_code}' \
-                        -X POST 'http://localhost:3200/api/v1/repos/$GITEA_USER_USERNAME/$SYNC_FORK_NAME/merge-upstream' \
-                        -H 'Authorization: token $GITEA_TOKEN' \
-                        -H 'Content-Type: application/json' \
-                        -d '{\"branch\":\"main\"}'")
+                    # Merge upstream into fork (fast-forward) on the
+                    # branch detected at script-start time (resolved into
+                    # $WORKSPACE_BRANCH from the GitHub API for the first
+                    # mirror URL — defaults to `main` if detection failed
+                    # or no token was supplied). Hardcoding `main` here
+                    # broke `master`-default upstreams: merge-upstream
+                    # 404s and the fork drifts.
+                    #
+                    # Auth header + branch body go through a remote
+                    # `curl --config` file (mode 0600, removed via local
+                    # trap) so $GITEA_TOKEN never appears in argv on the
+                    # server (would otherwise be visible in `ps` while
+                    # curl runs). Same argv-safe pattern as the other
+                    # token-bearing calls in this script.
+                    MERGE_TOKEN_B64=$(printf '%s' "$GITEA_TOKEN" | base64 | tr -d '\n')
+                    MERGE_BRANCH_B64=$(printf '%s' "$WORKSPACE_BRANCH" | base64 | tr -d '\n')
+                    MERGE_RESULT=$(ssh nexus "bash -s" <<REMOTE_MERGE_EOF 2>/dev/null
+TOK=\$(printf '%s' '$MERGE_TOKEN_B64' | base64 -d)
+BR=\$(printf '%s' '$MERGE_BRANCH_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+{
+    printf 'header = "Authorization: token %s"\n' "\$TOK"
+    printf 'header = "Content-Type: application/json"\n'
+} > "\$CFG"
+printf '{"branch":"%s"}' "\$BR" | curl -s -o /dev/null -w '%{http_code}' \\
+    -X POST 'http://localhost:3200/api/v1/repos/$GITEA_USER_USERNAME/$SYNC_FORK_NAME/merge-upstream' \\
+    --config "\$CFG" \\
+    --data-binary @-
+REMOTE_MERGE_EOF
+)
 
                     if [ "$MERGE_RESULT" = "200" ]; then
                         echo -e "${GREEN}  ✓ Fork synced from upstream (new commits merged)${NC}"
@@ -3406,6 +4731,61 @@ if echo "$ENABLED_SERVICES" | grep -qw "gitea" \
                 fi
             fi
         done
+
+        # Seed Nexus-Stack example workspace files into the now-existing
+        # fork. The mirror loop above OVERWRITES `$REPO_NAME` per
+        # iteration to the mirror's name (`mirror-readonly-<repo>`),
+        # which would make the seed POST hit the wrong repo. Restore
+        # `$REPO_NAME` to the FORK name (line 4204: `$FORK_NAME` =
+        # `${ORIG_NAME}_${GITEA_USER_SANITIZED}` = e.g.
+        # `Bsc_EDS_GIS_FS2026_stefan_koch`) before calling
+        # `seed_workspace_files`, and ensure `$GITEA_REPO_OWNER` is
+        # the user's username (the fork owner). POST is create-only,
+        # so files the fork already inherited from upstream get
+        # 422-skipped harmlessly.
+        if [ -n "${FORK_NAME:-}" ] && [ -n "${GITEA_USER_USERNAME:-}" ]; then
+            REPO_NAME="$FORK_NAME"
+            GITEA_REPO_OWNER="$GITEA_USER_USERNAME"
+            seed_workspace_files
+
+            # The Kestra-bootstrap block higher up in this script
+            # registered `system.flow-sync` and triggered ONE execution
+            # to verify the seeded flow was visible. In mirror mode that
+            # initial trigger ran BEFORE this fork was created, so the
+            # SyncFlows task got a 404 cloning the (then-nonexistent)
+            # fork. The flow itself is registered with the correct fork
+            # URL (we use $GITEA_REPO_OWNER/$REPO_NAME), so the next
+            # 15-min cron tick would eventually pick up the seeded
+            # content — but that's a poor onboarding signal. Trigger one
+            # more execution now that the fork actually exists; the user
+            # then sees `nexus-tutorials.r2-taxi-pipeline` in Kestra within
+            # ~10 s of deploy completion.
+            if [ -n "${KESTRA_PASS:-}" ] && [ -n "${ADMIN_EMAIL:-}" ]; then
+                echo "  Re-triggering system.flow-sync now that the fork is populated..."
+                TRIG_USER_B64=$(printf '%s' "$ADMIN_EMAIL" | base64 | tr -d '\n')
+                TRIG_PW_B64=$(printf '%s' "$KESTRA_PASS" | base64 | tr -d '\n')
+                # Use `curl -fsS` so a non-2xx response (e.g. Kestra
+                # unreachable, basic-auth failed) sets a non-zero exit
+                # status, propagated out of the heredoc, captured by
+                # the `if` guard. Previous `curl -s … || true` form
+                # silently masked failures and printed the green
+                # "triggered" line even when nothing was triggered.
+                if ssh nexus "bash -s" >/dev/null 2>&1 <<REMOTE_TRIG_EOF
+USER=\$(printf '%s' '$TRIG_USER_B64' | base64 -d)
+PW=\$(printf '%s' '$TRIG_PW_B64' | base64 -d)
+CFG=\$(mktemp)
+chmod 600 "\$CFG"
+trap 'rm -f "\$CFG"' EXIT
+printf 'user = "%s:%s"\n' "\$USER" "\$PW" > "\$CFG"
+curl -fsS -X POST 'http://localhost:8085/api/v1/executions/system/flow-sync' --config "\$CFG" >/dev/null
+REMOTE_TRIG_EOF
+                then
+                    echo -e "${GREEN}  ✓ system.flow-sync triggered — nexus-tutorials.r2-taxi-pipeline appears in Kestra within ~10 s${NC}"
+                else
+                    echo -e "${YELLOW}  ⚠ system.flow-sync re-trigger failed — the next 15-min cron tick will pick up the seeded flow${NC}"
+                fi
+            fi
+        fi
     fi
 
     # Restart git-integrated services so they pick up the latest fork content.
@@ -3430,7 +4810,7 @@ fi
 if echo "$ENABLED_SERVICES" | grep -qw "wikijs" && [ -n "$WIKIJS_ADMIN_PASS" ]; then
     (
         echo "  Configuring Wiki.js admin..."
-        WIKIJS_EMAIL="${USER_EMAIL:-$ADMIN_EMAIL}"
+        WIKIJS_EMAIL="${GITEA_USER_EMAIL:-$ADMIN_EMAIL}"
         for i in $(seq 1 30); do
             if ssh nexus "curl -fsS --connect-timeout 2 'http://localhost:3005/healthz'" 2>/dev/null | grep -qi 'ok'; then
                 break
@@ -3442,7 +4822,7 @@ if echo "$ENABLED_SERVICES" | grep -qw "wikijs" && [ -n "$WIKIJS_ADMIN_PASS" ]; 
         SETUP_PAYLOAD=$(jq -n \
             --arg email "$WIKIJS_EMAIL" \
             --arg pass "$WIKIJS_ADMIN_PASS" \
-            --arg url "https://wiki-stefan-hslu.nona.company" \
+            --arg url "https://wiki.${DOMAIN}" \
             '{query: "mutation ($input: SetupInput!) { setup(input: $input) { responseResult { succeeded message } } }", variables: {input: {adminEmail: $email, adminPassword: $pass, adminPasswordConfirm: $pass, siteUrl: $url, telemetry: false}}}')
 
         RESULT=$(printf '%s' "$SETUP_PAYLOAD" | ssh nexus "curl -s -X POST 'http://localhost:3005/graphql' \
