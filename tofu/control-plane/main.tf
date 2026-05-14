@@ -71,6 +71,11 @@ resource "cloudflare_workers_script" "scheduled_teardown" {
     text = var.base_domain
   }
 
+  plain_text_binding {
+    name = "BASE_DOMAIN"
+    text = var.base_domain
+  }
+
   # BASE_DOMAIN is the Resend-verified parent domain used as the email
   # sender. Only emit the binding when it's actually set — Cloudflare's
   # Workers API rejects `plain_text_binding` with empty text, and the
@@ -180,6 +185,7 @@ resource "cloudflare_pages_project" "control_plane" {
         GITHUB_OWNER                = var.github_owner
         GITHUB_REPO                 = var.github_repo
         DOMAIN                      = var.domain
+        BASE_DOMAIN                  = var.base_domain
         BASE_DOMAIN                  = var.base_domain
         BASE_DOMAIN                  = var.base_domain
         ADMIN_EMAIL                 = var.admin_email
