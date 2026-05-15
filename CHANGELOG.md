@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.61.0](https://github.com/stefanko-ch/Nexus-Stack/compare/v0.60.0...v0.61.0) (2026-05-13)
+
+
+### 🚀 Features
+
+* **stacks:** Add Chroma embedding (vector) database ([#577](https://github.com/stefanko-ch/Nexus-Stack/issues/577)) ([9b678a9](https://github.com/stefanko-ch/Nexus-Stack/commit/9b678a9c103180c9d32db2070a38263ea8be415d)), closes [#378](https://github.com/stefanko-ch/Nexus-Stack/issues/378)
+
+
+### ♻️ Refactoring
+
+* **control-plane:** Consolidate stack URL builders via window.NS ([#579](https://github.com/stefanko-ch/Nexus-Stack/issues/579)) ([76e6c6f](https://github.com/stefanko-ch/Nexus-Stack/commit/76e6c6fb5ba4133882b0418cc715ffedb494e950))
+
+## [0.60.0](https://github.com/stefanko-ch/Nexus-Stack/compare/v0.59.0...v0.60.0) (2026-05-13)
+
+
+### 🚀 Features
+
+* **stacks:** Add Crawl4AI LLM-friendly web crawler ([#575](https://github.com/stefanko-ch/Nexus-Stack/issues/575)) ([38bac22](https://github.com/stefanko-ch/Nexus-Stack/commit/38bac2237fa15a64ee5f5390a9d0974be98876bd)), closes [#391](https://github.com/stefanko-ch/Nexus-Stack/issues/391)
+
+## [0.59.0](https://github.com/stefanko-ch/Nexus-Stack/compare/v0.58.4...v0.59.0) (2026-05-13)
+
+
+### 🚀 Features
+
+* **stacks:** Add Big-AGI multi-LLM web UI ([#574](https://github.com/stefanko-ch/Nexus-Stack/issues/574)) ([723d675](https://github.com/stefanko-ch/Nexus-Stack/commit/723d67535b450654698f74a648f4b3fd0ae9932f)), closes [#394](https://github.com/stefanko-ch/Nexus-Stack/issues/394)
+
+
+### 🐛 Bug Fixes
+
+* **stacks:** Bump Budibase memory limit to 4 GB ([#572](https://github.com/stefanko-ch/Nexus-Stack/issues/572)) ([fe35801](https://github.com/stefanko-ch/Nexus-Stack/commit/fe358018ff883084db9a032e7c57f3b0738c8606)), closes [#546](https://github.com/stefanko-ch/Nexus-Stack/issues/546)
+
 ## [0.58.4](https://github.com/stefanko-ch/Nexus-Stack/compare/v0.58.3...v0.58.4) (2026-05-12)
 
 

@@ -11,10 +11,13 @@ Images are pinned to **major versions** where supported for automatic security p
 | AKHQ | `tchiotludo/akhq` | `0.27.0` | Exact ¹ |
 | Adminer | `adminer` | `latest` | Latest ² |
 | Appsmith | `appsmith/appsmith-ce` | `v1.98` | Minor |
+| Big-AGI | `ghcr.io/enricoros/big-agi` | `v2.0.4` | Exact ¹ |
 | Budibase | `budibase/budibase` | `latest` | Latest ² |
+| Chroma | `chromadb/chroma` | `1.5.9` | Exact ¹ |
 | CloudBeaver | `dbeaver/cloudbeaver` | `24` | Major |
 | ClickHouse | `clickhouse/clickhouse-server` | `25.8.16.34` | Exact ¹ |
 | code-server | `codercom/code-server` | `latest` | Latest ² |
+| Crawl4AI | `unclecode/crawl4ai` | `0.8.6` | Exact ¹ |
 | Dagster | dagster (custom build) | `1.12.21` | Exact ³ |
 | Debezium | `quay.io/debezium/connect` | `3.5.0` | Exact ¹ |
 | Dinky | `dinkydocker/dinky-standalone-server` | `1.2.5-flink1.20` | Exact ¹ |
@@ -121,10 +124,13 @@ Images are pinned to **major versions** where supported for automatic security p
 | **Adminer** | Lightweight database management tool | [adminer.md](adminer.md) |
 | **Apache Spark** | Distributed data processing engine | [spark.md](spark.md) |
 | **Appsmith** | Low-code platform for admin panels and internal tools | [appsmith.md](appsmith.md) |
+| **Big-AGI** | Stateless multi-LLM web UI (OpenAI, Anthropic, local) | [big-agi.md](big-agi.md) |
 | **Budibase** | Low-code platform for internal tools | [budibase.md](budibase.md) |
+| **Chroma** | Embedding (vector) database for LLM / RAG | [chroma.md](chroma.md) |
 | **CloudBeaver** | Web-based database management tool | [cloudbeaver.md](cloudbeaver.md) |
 | **ClickHouse** | Columnar database for real-time analytics | [clickhouse.md](clickhouse.md) |
 | **code-server** | VS Code in the browser | [code-server.md](code-server.md) |
+| **Crawl4AI** | LLM-friendly web crawler for RAG | [crawl4ai.md](crawl4ai.md) |
 | **Dagster** | Python data orchestration | [dagster.md](dagster.md) |
 | **Debezium** | Change data capture platform | [debezium.md](debezium.md) |
 | **Dify** | AI workflow builder for LLM applications | [dify.md](dify.md) |
